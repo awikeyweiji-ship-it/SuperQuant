@@ -6,12 +6,23 @@
 3) 行情快照获取加固：AkShare -> 东财 push2 -> 历史缓存兜底（UI 不再空白）
 4) 侧边栏新增：数据源健康自检（Spot 来源/是否陈旧）
 5) DeepSearch 离线时不再“空白”，会给出提示
+6) 机会雷达升级：新增 `opportunity_radar.py`，把政策/情绪/资金/估值/需求/宏观 七维因子编排成可比分数+买入建议表格（缺数据时自动降级为中性）。
 
 ## 如何使用（替换）
 - 解压覆盖到你的项目目录（建议先备份原目录）
 - 运行：
-  - Web：`streamlit run app.py`
-  - 定时指挥塔：`python scheduler_service.py`
+- Web：`streamlit run app.py`
+- 定时指挥塔：`python scheduler_service.py`
+
+### 机会雷达（新）
+- 直接引用：
+  ```python
+  from opportunity_radar import OpportunityRadar
+  radar = OpportunityRadar()
+  df = radar.build_radar_table(["000001", "600519"])  # 输出多维评分 + 建议
+  ```
+  可传入 MarketScanner 的 `scan` 结果或 DataEngine 快照，自动对齐 sector/资金/舆情因子。
+  表字段示例：`policy_score/sentiment_score/capital_score/valuation_score/demand_score/growth_score/momentum_score/macro_score/radar_score/recommendation/data_gaps/evidence`，其中 `data_gaps` 提示缺失因子，`evidence` 汇总政策/资金/估值/宏观等依据。
 
 ## 配置方式
 ### 方式1：在 Web 页面保存（推荐）

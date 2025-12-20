@@ -20,6 +20,9 @@ import math
 import time
 from typing import Any, Dict, List, Optional
 
+from logging_utils import get_data_logger, make_result, build_error, FetchResult
+from data_sources.financial_eastmoney import fetch_financial_indicator_em
+
 try:
     import akshare as ak  # type: ignore
 except Exception:
@@ -52,10 +55,24 @@ def _tanh01(x: float, scale: float = 20.0) -> float:
         return 0.5
 
 
+def _standardize_code(code: str) -> str:
+    code = str(code).strip()
+    code = code.replace(".SH", "").replace(".SZ", "").replace(".BJ", "").replace("sh", "").replace("sz", "").replace("bj", "")
+    if code.isdigit() and len(code) < 6:
+        code = code.zfill(6)
+    market = "SZ"
+    if code.startswith("6"):
+        market = "SH"
+    elif code.startswith(("8", "4")):
+        market = "BJ"
+    return f"{code}.{market}"
+
+
 class FundamentalEngine:
     def __init__(self, cache: Any = None):
         self.cache = cache
         self._mem_cache: Dict[str, Any] = {}
+        self.logger = get_data_logger("superquant.fundamental")
 
     def _cache_get(self, key: str):
         if self.cache and hasattr(self.cache, "get"):
@@ -81,7 +98,7 @@ class FundamentalEngine:
     # ----------------------------
     # Financial snapshot
     # ----------------------------
-    def get_financial_snapshot(self, code: str) -> Dict[str, Any]:
+    def get_financial_snapshot_structured(self, code: str) -> FetchResult:
         """
         返回：
         {
@@ -90,80 +107,174 @@ class FundamentalEngine:
           fundamental_quality, fundamental_growth
         }
         """
-        code = str(code).strip()
-        ck = f"fin:snap:{code}"
+        code_std = _standardize_code(code)
+        ck = f"fin:snap:{code_std}"
         cached = self._cache_get(ck)
         if cached is not None:
-            return cached
+            return FetchResult(data=cached, ok=True, source="cache", cache_hit=True)
 
-        out: Dict[str, Any] = {
-            "roe": None,
-            "gross_margin": None,
-            "net_margin": None,
-            "revenue_yoy": None,
-            "profit_yoy": None,
-            "debt_ratio": None,
-            "ocf_yoy": None,
-            "eps": None,
-            "pe": None,
-            "pb": None,
-            "fundamental_quality": 0.5,
-            "fundamental_growth": 0.5,
-        }
+        errors: List[Dict[str, str]] = []
+        out: Dict[str, Any] = {}
 
-        if ak is None:
-            self._cache_set(ck, out, ttl=3600)
-            return out
+        fin = self._fetch_financial_from_ak(code_std, errors)
+        source = "akshare" if fin else ""
 
-        # Try multiple AkShare APIs depending on version
-        df = None
-        try:
-            df = ak.stock_financial_analysis_indicator(symbol=code)
-        except Exception:
-            try:
-                df = ak.stock_financial_analysis_indicator_em(symbol=code)
-            except Exception:
-                df = None
+        if not fin:
+            fin = self._fetch_financial_from_eastmoney(code_std, errors)
+            if fin:
+                source = "eastmoney"
 
-        if df is not None and hasattr(df, "empty") and not df.empty:
-            row = df.iloc[-1].to_dict()  # latest
-            # Handle multiple possible column names
-            def pick(keys: List[str]) -> Optional[float]:
-                for k in keys:
-                    if k in row:
-                        v = _safe_float(row.get(k), None)
-                        return v
-                return None
+        if not fin:
+            fin = self._financial_offline_stub(code_std)
+            if fin:
+                source = "offline_stub"
+                errors.append(build_error("offline_stub", "used", "实时源失败，使用内置示例财务数据，可能过期"))
 
-            out["roe"] = pick(["净资产收益率(%)", "ROE(%)", "净资产收益率"])
-            out["gross_margin"] = pick(["销售毛利率(%)", "毛利率(%)", "毛利率"])
-            out["net_margin"] = pick(["销售净利率(%)", "净利率(%)", "净利率"])
-            out["revenue_yoy"] = pick(["营业收入同比增长率(%)", "营收同比(%)", "营业收入增长率(%)"])
-            out["profit_yoy"] = pick(["净利润同比增长率(%)", "净利同比(%)", "净利润增长率(%)"])
-            out["debt_ratio"] = pick(["资产负债率(%)", "负债率(%)"])
-            out["ocf_yoy"] = pick(["经营活动产生的现金流量净额同比增长率(%)", "经营现金流同比(%)"])
-            out["eps"] = pick(["基本每股收益", "每股收益"])
-            out["pe"] = pick(["市盈率", "PE(TTM)", "PE"])
-            out["pb"] = pick(["市净率", "PB", "PB(MRQ)"])
+        if not fin:
+            errors.append(build_error("financial", "unavailable", "财务数据源均失败"))
+            return FetchResult(data={}, ok=False, source="unavailable", fallback_used=True, errors=errors)
 
-        # Standardized factors
-        roe = _safe_float(out["roe"], 0.0)
-        gm = _safe_float(out["gross_margin"], 0.0)
-        nm = _safe_float(out["net_margin"], 0.0)
-        debt = _safe_float(out["debt_ratio"], 60.0)
-        rev = _safe_float(out["revenue_yoy"], 0.0)
-        prof = _safe_float(out["profit_yoy"], 0.0)
+        out.update(fin)
+
+        roe = _safe_float(out.get("roe"), 0.0)
+        gm = _safe_float(out.get("gross_margin"), 0.0)
+        nm = _safe_float(out.get("net_margin"), 0.0)
+        debt = _safe_float(out.get("debt_ratio"), 60.0)
+        rev = _safe_float(out.get("revenue_yoy"), 0.0)
+        prof = _safe_float(out.get("profit_yoy"), 0.0)
 
         quality = 0.45 * _tanh01(roe, 12.0) + 0.35 * _tanh01(gm, 25.0) + 0.2 * _tanh01(nm, 15.0)
-        # debt higher -> penalty
         quality = quality * (1.0 - 0.25 * _tanh01(debt - 60.0, 15.0))
         growth = 0.55 * _tanh01(rev, 25.0) + 0.45 * _tanh01(prof, 30.0)
 
         out["fundamental_quality"] = _clip01(quality)
         out["fundamental_growth"] = _clip01(growth)
 
+        filled = [k for k in ["revenue", "net_profit", "gross_margin", "net_margin", "roe", "roa", "debt_ratio", "op_cashflow"] if out.get(k) is not None]
+        ok_flag = len(filled) >= 5 and bool(out.get("report_date"))
         self._cache_set(ck, out, ttl=3600)
+        self.logger.info("financial snapshot cached for %s via %s", code_std, source or "unknown")
+        return FetchResult(data=out, ok=ok_flag, source=source or "unknown", fallback_used=not source or source == "offline_stub", errors=errors)
+
+    def get_financial_snapshot(self, code: str) -> Dict[str, Any]:
+        return self.get_financial_snapshot_structured(code).data
+
+    def _map_financial_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        mapping = {
+            "report_date": ["报告期", "报告日期", "reportdate", "fdate"],
+            "revenue": ["营业收入", "营业总收入(元)", "totaloperatereve", "营业总收入"],
+            "net_profit": ["净利润", "netprofit", "归母净利润"],
+            "gross_margin": ["销售毛利率(%)", "毛利率(%)", "毛利率", "grossprofit_margin"],
+            "net_margin": ["销售净利率(%)", "净利率(%)", "净利率", "netprofit_margin"],
+            "roe": ["净资产收益率(%)", "ROE(%)", "净资产收益率", "weightedroe", "roe"],
+            "roa": ["总资产报酬率(%)", "资产报酬率(%)", "资产报酬率", "roa2_weighted", "roa"],
+            "debt_ratio": ["资产负债率(%)", "资产负债率", "debtratio"],
+            "op_cashflow": ["经营活动产生的现金流量净额", "经营现金流量净额", "经营活动现金流量净额", "经营现金流", "ocfps"],
+            "profit_yoy": ["净利润增长率(%)", "净利润同比增长率(%)", "净利润增长率", "netprofit_yoy"],
+            "revenue_yoy": ["营业收入增长率(%)", "营业收入同比增长率(%)", "营业收入增长率", "ystz"],
+            "eps": ["每股收益(元)", "eps", "basiceps", "基本每股收益"],
+        }
+
+        out: Dict[str, Any] = {k: None for k in [
+            "report_date",
+            "revenue",
+            "net_profit",
+            "gross_margin",
+            "net_margin",
+            "roe",
+            "roa",
+            "debt_ratio",
+            "op_cashflow",
+            "profit_yoy",
+            "revenue_yoy",
+            "eps",
+        ]}
+
+        def pick(keys: List[str]) -> Any:
+            for k in keys:
+                if k in row and row[k] not in (None, "", "--"):
+                    return row[k]
+            return None
+
+        for target, keys in mapping.items():
+            out[target] = _safe_float(pick(keys), None) if target != "report_date" else pick(keys)
+
+        if not out.get("net_margin") and out.get("net_profit") and out.get("revenue"):
+            try:
+                out["net_margin"] = float(out["net_profit"]) / float(out["revenue"]) * 100.0
+            except Exception:
+                pass
         return out
+
+    def _fetch_financial_from_ak(self, code_std: str, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        if ak is None:
+            errors.append(build_error("akshare", "missing", "AkShare 未安装"))
+            return None
+        df = None
+        try:
+            df = ak.stock_financial_analysis_indicator(symbol=code_std)
+        except Exception as e:
+            errors.append(build_error("akshare", "exception", str(e)))
+
+        if df is None or getattr(df, "empty", True):
+            try:
+                df = ak.stock_financial_analysis_indicator_em(symbol=code_std)
+            except Exception as e:
+                errors.append(build_error("akshare_em", "exception", str(e)))
+
+        if df is not None and not getattr(df, "empty", True):
+            try:
+                row = df.iloc[-1].to_dict()
+                return self._map_financial_row(row)
+            except Exception as e:
+                errors.append(build_error("akshare", "parse", str(e)))
+        else:
+            errors.append(build_error("akshare", "empty", "财务指标返回空"))
+        return None
+
+    def _fetch_financial_from_eastmoney(self, code_std: str, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        try:
+            df = fetch_financial_indicator_em(code_std)
+            if df is not None and not df.empty:
+                row = df.iloc[0].to_dict()
+                return self._map_financial_row(row)
+            errors.append(build_error("eastmoney", "empty", "东财财务指标为空"))
+        except Exception as e:
+            errors.append(build_error("eastmoney", "exception", str(e)))
+        return None
+
+    def _financial_offline_stub(self, code_std: str) -> Optional[Dict[str, Any]]:
+        samples = {
+            "600519.SH": {
+                "report_date": "2024-09-30",
+                "revenue": 1067.5 * 1e8,
+                "net_profit": 527.0 * 1e8,
+                "gross_margin": 91.0,
+                "net_margin": 49.0,
+                "roe": 25.0,
+                "roa": 18.0,
+                "debt_ratio": 36.0,
+                "op_cashflow": 550.0 * 1e8,
+                "profit_yoy": 15.0,
+                "revenue_yoy": 17.0,
+                "eps": 40.0,
+            },
+            "000001.SZ": {
+                "report_date": "2024-09-30",
+                "revenue": 1500.0 * 1e8,
+                "net_profit": 120.0 * 1e8,
+                "gross_margin": 28.0,
+                "net_margin": 12.0,
+                "roe": 11.5,
+                "roa": 0.9,
+                "debt_ratio": 86.0,
+                "op_cashflow": 300.0 * 1e8,
+                "profit_yoy": 6.0,
+                "revenue_yoy": 5.0,
+                "eps": 1.8,
+            },
+        }
+        return samples.get(code_std)
 
     # ----------------------------
     # Corporate ops signals

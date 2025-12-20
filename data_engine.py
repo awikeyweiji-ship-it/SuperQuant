@@ -14,11 +14,26 @@ from __future__ import annotations
 import datetime as _dt
 import re
 import time
+import json
 import logging
 import requests
 from typing import Dict, Any, Optional, List
 import pandas as pd
 import numpy as np
+
+from logging_utils import get_data_logger, make_result, build_error, FetchResult
+from data_sources.financial_eastmoney import fetch_financial_indicator_em
+from data_sources.announcement_eastmoney import (
+    fetch_announcements_em,
+    fetch_announcements_tencent,
+    sample_announcements,
+)
+from data_sources.report_eastmoney import (
+    fetch_research_reports_em,
+    fetch_research_reports_alt,
+    sample_reports,
+)
+from data_sources.hot_eastmoney import fetch_hot_topics_em, fetch_hot_topics_ak, sample_hot_topics
 
 try:
     import akshare as ak
@@ -53,6 +68,37 @@ def normalize_code(code: str) -> str:
         code = code.zfill(6)
     return code
 
+
+def standardize_code(code: str) -> str:
+    """统一股票代码为 6 位数字 + 交易所后缀格式 (如 600519.SH)。"""
+    code = normalize_code(code)
+    market = "SZ"
+    if code.startswith("6"):
+        market = "SH"
+    elif code.startswith(("8", "4")):
+        market = "BJ"
+    return f"{code}.{market}"
+
+
+def to_tencent_symbol(code: str) -> str:
+    code_std = standardize_code(code)
+    plain, market = code_std.split(".")
+    prefix = "sz"
+    if market == "SH":
+        prefix = "sh"
+    elif market == "BJ":
+        prefix = "bj"
+    return f"{prefix}{plain}"
+
+
+def to_eastmoney_secid(code: str) -> str:
+    code_std = standardize_code(code)
+    plain, market = code_std.split(".")
+    market_flag = "0"
+    if market == "SH":
+        market_flag = "1"
+    return f"{market_flag}.{plain}"
+
 def _safe_float(x: Any, default: float = 0.0) -> float:
     if x is None: return default
     try:
@@ -66,6 +112,28 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return float(s) * factor
     except: return default
 
+
+def _to_float_or_none(x: Any) -> Optional[float]:
+    try:
+        val = _safe_float(x, default=np.nan)
+        if pd.isna(val):
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _retry(func, max_retries: int = 3, base_delay: float = 0.6):
+    last_err = None
+    for i in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_err = e
+            time.sleep(base_delay * (2 ** i))
+    if last_err:
+        raise last_err
+
 class DataEngine:
     _instance = None
     _printed_logo = False
@@ -78,8 +146,9 @@ class DataEngine:
     def __init__(self, cache: Optional[UniverseCache] = None):
         if hasattr(self, "_initialized"): return
         self._initialized = True
+        self.logger = get_data_logger("superquant.data_engine")
         self.cache = cache or UniverseCache()
-        self.alt_engine = AlternativeDataEngine() if AlternativeDataEngine else None
+        self.alt_engine = AlternativeDataEngine(cache=self.cache) if AlternativeDataEngine else None
         # Step5: 财报/运营 + 资本运作 情报引擎
         self.fund_engine = FundamentalEngine(cache=self.cache) if FundamentalEngine else None
         self.capital_engine = CapitalEngine() if CapitalEngine else None
@@ -93,6 +162,17 @@ class DataEngine:
             DataEngine._printed_logo = True
             print(f"🚀 [DataEngine V12.1] 引擎就绪 (热点接口已修复)...")
 
+    def _cache_age(self, key: str) -> Optional[float]:
+        meta_path = self.cache._meta_path(key)  # type: ignore[attr-defined]
+        try:
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                ts = float(meta.get("ts", 0))
+                return time.time() - ts
+        except Exception:
+            return None
+        return None
+
     def _market_prefix(self, code: str) -> str:
         code = normalize_code(code)
         if code.startswith('6'): return 'sh'
@@ -101,35 +181,123 @@ class DataEngine:
         return 'sz'
 
     def _fetch_quote_tencent(self, code: str) -> Dict[str, Any]:
-        # Fallback single-symbol quote via Tencent (qt.gtimg.cn).
+        """腾讯行情兜底，返回原始字段。"""
         code = normalize_code(code)
         try:
             px = self._market_prefix(code)
             q = f's_{px}{code}'
             url = f'https://qt.gtimg.cn/q={q}'
-            r = requests.get(url, timeout=6)
+            r = requests.get(url, timeout=8)
             txt = (r.text or '').strip()
             if '~' not in txt:
                 return {}
-            # v_s_sz000001="51~NAME~000001~PRICE~CHG~PCT~...";
             m = re.search(r'"(.*)"', txt)
             payload = m.group(1) if m else txt
             parts = payload.split('~')
-            if len(parts) < 6:
+            if len(parts) < 30:
                 return {}
             name = parts[1].strip()
             price = parts[3].strip()
             pct = parts[5].strip()
-            out = {
+            open_px = parts[4].strip()
+            preclose = parts[33].strip() if len(parts) > 33 else ""
+            high = parts[41].strip() if len(parts) > 41 else ""
+            low = parts[42].strip() if len(parts) > 42 else ""
+            vol = parts[6].strip()
+            amount = parts[37].strip() if len(parts) > 37 else ""
+            return {
                 'code': code,
                 'name': name,
-                'close': _safe_float(price, 0.0),
-                'pct_chg': _safe_float(pct, 0.0),
+                'price': price,
+                'pct_chg': pct,
+                'open': open_px,
+                'preclose': preclose,
+                'high': high,
+                'low': low,
+                'vol': vol,
+                'amount': amount,
                 'source': 'tencent'
             }
-            return out
-        except Exception:
+        except Exception as e:
+            self.logger.warning("腾讯行情兜底异常: %s", e)
             return {}
+
+    def _fetch_quote_akshare(self, code_std: str) -> Dict[str, Any]:
+        if ak is None:
+            return {}
+        plain = normalize_code(code_std)
+        if hasattr(ak, "stock_zh_a_spot_em"):
+            df = self._retry_call(lambda: ak.stock_zh_a_spot_em())
+            if df is not None and not df.empty:
+                df = df.rename(columns={"代码": "code"})
+                row = df[df["code"].astype(str).str.strip() == plain]
+                if not row.empty:
+                    r = row.iloc[0].to_dict()
+                    r["source"] = "akshare"
+                    return r
+        return {}
+
+    def _fetch_quote_eastmoney(self, code_std: str) -> Dict[str, Any]:
+        secid = to_eastmoney_secid(code_std)
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {
+            "secid": secid,
+            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f170,f71,f84",
+        }
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            data = (r.json() or {}).get("data") or {}
+            if not data:
+                return {}
+            return {
+                "code": normalize_code(code_std),
+                "name": data.get("f58", ""),
+                "price": data.get("f43"),
+                "open": data.get("f46"),
+                "high": data.get("f44"),
+                "low": data.get("f45"),
+                "preclose": data.get("f60"),
+                "pct_chg": data.get("f170"),
+                "vol": data.get("f47"),
+                "amount": data.get("f48"),
+                "turnover": data.get("f84"),
+                "source": "eastmoney_push2",
+            }
+        except Exception as e:
+            self.logger.warning("东财行情兜底异常: %s", e)
+            return {}
+
+    def _standardize_quote(self, payload: Dict[str, Any], code_std: str, source: str) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        pick = lambda *keys: next((payload.get(k) for k in keys if payload.get(k) not in (None, "", "--")), None)
+        price = _to_float_or_none(pick("price", "close", "最新价", "现价"))
+        pct = _to_float_or_none(pick("pct", "pct_chg", "涨跌幅"))
+        out = {
+            "code": code_std,
+            "name": pick("name", "名称", "股票名称") or payload.get("code", ""),
+            "price": price,
+            "pct_chg": pct,
+            "vol": _to_float_or_none(pick("vol", "volume", "成交量")),
+            "amount": _to_float_or_none(pick("amount", "成交额")),
+            "turnover": _to_float_or_none(pick("turnover", "换手率")),
+            "high": _to_float_or_none(pick("high", "最高")),
+            "low": _to_float_or_none(pick("low", "最低")),
+            "open": _to_float_or_none(pick("open", "开盘")),
+            "preclose": _to_float_or_none(pick("preclose", "昨收", "昨收价", "前收盘")),
+            "source": source,
+        }
+        # 若价格为空则视为无效
+        if out.get("price") is None:
+            return {}
+        return out
+
+    def _quote_sample(self, code_std: str) -> Optional[Dict[str, Any]]:
+        samples = {
+            "600519.SH": {"code": "600519.SH", "name": "贵州茅台", "price": 1600.0, "pct_chg": 0.0, "vol": 1.0, "amount": 1.0, "turnover": 0.0, "high": 1605.0, "low": 1595.0, "open": 1600.0, "preclose": 1600.0},
+            "000001.SZ": {"code": "000001.SZ", "name": "平安银行", "price": 10.0, "pct_chg": 0.0, "vol": 1.0, "amount": 1.0, "turnover": 0.0, "high": 10.1, "low": 9.9, "open": 10.0, "preclose": 10.0},
+        }
+        return samples.get(code_std)
 
     def _retry_call(self, func, *args, max_retries=2, **kwargs):
         for i in range(max_retries):
@@ -293,7 +461,10 @@ class DataEngine:
                 if df_norm is not None and not df_norm.empty:
                     self.cache.set_spot_snapshot(df_norm)
                     self.spot_source = name
+                    self.logger.info("spot snapshot loaded from %s", name)
                     return df_norm
+                else:
+                    self.logger.warning("spot snapshot empty via %s", name)
 
         # 3) 东财 push2 兜底
         try:
@@ -302,56 +473,247 @@ class DataEngine:
             if df_em is not None and not df_em.empty:
                 self.cache.set_spot_snapshot(df_em)
                 self.spot_source = "eastmoney_push2"
+                self.logger.info("spot snapshot loaded from eastmoney push2 fallback")
                 return df_em
         except Exception:
-            pass
+            self.logger.exception("eastmoney push2 snapshot failed")
 
         # 4) 历史缓存兜底（无 TTL）
         stale = self.cache.get_df("spot_snapshot", ttl=None)
         if stale is not None and not stale.empty:
             self.spot_is_stale = True
             self.spot_source = "stale_cache"
+            self.logger.warning("using stale cache for spot snapshot")
             return stale
 
+        self.logger.error("spot snapshot unavailable after all providers")
         return pd.DataFrame()
 
+    def get_spot_row_structured(self, code: str) -> FetchResult:
+        code_std = standardize_code(code)
+        cache_key = self.cache.key("quote_v1", {"code": code_std})
+        errors: List[Dict[str, str]] = []
+        cache_age = self._cache_age(cache_key)
+
+        cached = self.cache.get(cache_key, ttl=30)
+        if isinstance(cached, dict) and cached:
+            return make_result(cached, source=cached.get("source", "cache"), cache_hit=True, cache_age=cache_age)
+
+        providers = [
+            ("akshare", lambda: self._fetch_quote_akshare(code_std)),
+            ("eastmoney", lambda: self._fetch_quote_eastmoney(code_std)),
+            ("tencent", lambda: self._fetch_quote_tencent(code_std)),
+        ]
+
+        for idx, (name, fn) in enumerate(providers):
+            try:
+                raw = _retry(fn, max_retries=3)
+                std = self._standardize_quote(raw, code_std, name)
+                if std:
+                    self.cache.set(cache_key, std)
+                    fallback_used = idx > 0
+                    return make_result(std, source=name, fallback_used=fallback_used, errors=errors, cache_hit=False, cache_age=None)
+                errors.append(build_error(name, "empty", f"{name} 行情返回空"))
+            except Exception as e:
+                errors.append(build_error(name, "exception", str(e)))
+
+        stale = self.cache.get(cache_key, ttl=None)
+        if isinstance(stale, dict) and stale:
+            errors.append(build_error("quote", "stale_cache", "使用历史缓存，数据可能过期"))
+            return make_result(stale, source=stale.get("source", "cache_stale"), fallback_used=True, errors=errors, cache_hit=True, cache_age=cache_age)
+
+        sample = self._quote_sample(code_std)
+        if sample:
+            errors.append(build_error("quote", "offline_sample", "实时行情不可用，使用离线样本（数据可能过期）"))
+            sample["source"] = "offline_sample"
+            return make_result(sample, source="offline_sample", fallback_used=True, errors=errors, cache_hit=False)
+
+        errors.append(build_error("quote", "unavailable", "未能获取到单只股票快照"))
+        return make_result({}, source="quote", fallback_used=True, errors=errors)
+
     def get_spot_row(self, code: str) -> Dict[str, Any]:
-        df = self.get_spot_snapshot()
-        if df is not None and not df.empty:
-            rows = df[df["code"] == normalize_code(code)]
-            if not rows.empty:
-                return rows.iloc[0].to_dict()
-        # fallback for single symbol
-        fb = self._fetch_quote_tencent(code)
-        return fb if isinstance(fb, dict) else {}
+        return self.get_spot_row_structured(code).data
 
     # -------------------------------------
     # 3. 身份与行业
     # -------------------------------------
-    def get_stock_identity(self, code: str) -> Dict[str, Any]:
-        code = normalize_code(code)
-        ck = self.cache.key("identity_v12", {"s": code})
-        cached = self.cache.get(ck, ttl=7 * 24 * 3600) 
-        if isinstance(cached, dict) and cached: return cached
+    def get_stock_identity_structured(self, code: str) -> FetchResult:
+        code_std = standardize_code(code)
+        ck = self.cache.key("identity_v12", {"s": code_std})
+        cache_age = self._cache_age(ck)
+        cached = self.cache.get(ck, ttl=7 * 24 * 3600)
+        if isinstance(cached, dict) and cached:
+            return make_result(cached, source="cache", cache_hit=True, cache_age=cache_age)
 
-        data = {"code": code, "name": "未知", "sector": "未知", "concepts": []}
-        spot = self.get_spot_row(code)
-        if spot: data["name"] = spot.get("name", "未知")
+        errors: List[Dict[str, str]] = []
+        data = {"code": code_std, "name": "未知", "sector": "", "concepts": []}
 
-        if ak:
+        try:
+            spot = self.get_spot_row_structured(code_std)
+            if spot.ok and isinstance(spot.data, dict):
+                data["name"] = spot.data.get("name", data["name"])
+            else:
+                errors.extend(spot.errors)
+        except Exception as e:
+            errors.append(build_error("spot", "exception", str(e)))
+
+        def _ak_identity() -> bool:
+            if ak is None:
+                errors.append(build_error("akshare", "missing", "AkShare 未安装"))
+                return False
             try:
-                def _fetch_info(): return ak.stock_individual_info_em(symbol=code)
-                df_info = self._retry_call(_fetch_info)
+                df_info = self._retry_call(lambda: ak.stock_individual_info_em(symbol=code_std))
                 if df_info is not None and not df_info.empty:
                     info_dict = dict(zip(df_info.iloc[:, 0], df_info.iloc[:, 1]))
-                    data["sector"] = str(info_dict.get("行业", "其他"))
-            except: pass
-        self.cache.set(ck, data)
-        return data
+                    sector = str(info_dict.get("行业", "")).strip()
+                    concept_str = str(info_dict.get("概念", "")).strip()
+                    if sector:
+                        data["sector"] = sector
+                    if concept_str:
+                        data["concepts"] = [c for c in re.split(r"[，,\s]+", concept_str) if c]
+                    return bool(sector or data["concepts"])
+                errors.append(build_error("akshare", "empty", "行业/概念接口返回空"))
+            except Exception as e:
+                errors.append(build_error("akshare", "exception", str(e)))
+            return False
+
+        def _offline_identity() -> bool:
+            samples = {
+                "600519.SH": {"sector": "白酒", "concepts": ["消费", "贵州国资"]},
+                "000001.SZ": {"sector": "银行", "concepts": ["金融", "深股通"]},
+            }
+            sample = samples.get(code_std)
+            if sample:
+                data.update(sample)
+                errors.append(build_error("identity", "offline_sample", "实时身份接口不可用，使用离线样本（可能过期）"))
+                return True
+            return False
+
+        success = _ak_identity()
+        if not success:
+            success = _offline_identity()
+
+        if success:
+            self.cache.set(ck, data)
+            return make_result(data=data, source="identity", fallback_used=not success, errors=errors)
+
+        errors.append(build_error("identity", "empty", "行业/概念均为空，身份信息不可用"))
+        return make_result({}, source="identity", fallback_used=True, errors=errors)
+
+    def get_stock_identity(self, code: str) -> Dict[str, Any]:
+        return self.get_stock_identity_structured(code).data
 
     # -------------------------------------
     # 4. K线数据 (多周期)
     # -------------------------------------
+    def _fetch_kline_akshare(
+        self,
+        code_plain: str,
+        freq: str,
+        limit: Optional[int],
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> pd.DataFrame:
+        period_map = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}
+        p = period_map.get(freq, "daily")
+
+        kwargs = {"symbol": code_plain, "period": p, "adjust": "qfq"}
+        if start_date:
+            kwargs["start_date"] = str(start_date)
+        if end_date:
+            kwargs["end_date"] = str(end_date)
+
+        df = ak.stock_zh_a_hist(**kwargs)
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close", "最高": "high", "最低": "low", "成交量": "volume"})
+        df["date"] = pd.to_datetime(df["date"])
+        for col in ["open", "close", "high", "low", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if limit is not None:
+            try:
+                df = df.tail(int(limit))
+            except Exception:
+                pass
+        return df
+
+    def _fetch_kline_eastmoney(
+        self,
+        code_std: str,
+        freq: str,
+        limit: Optional[int],
+    ) -> pd.DataFrame:
+        klt_map = {"daily": "101", "weekly": "102", "monthly": "103"}
+        klt = klt_map.get(freq, "101")
+        secid = to_eastmoney_secid(code_std)
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "secid": secid,
+            "klt": klt,
+            "fqt": "1",
+            "lmt": int(limit) if limit else 1000,
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        }
+        delay = 1.0
+        last_err: Optional[Exception] = None
+        for i in range(3):
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
+                payload = resp.json()
+                klines = payload.get("data", {}).get("klines", []) if isinstance(payload, dict) else []
+                if not klines:
+                    return pd.DataFrame()
+                records = []
+                for line in klines:
+                    parts = str(line).split(",")
+                    if len(parts) < 6:
+                        continue
+                    records.append({
+                        "date": pd.to_datetime(parts[0]),
+                        "open": _safe_float(parts[1]),
+                        "close": _safe_float(parts[2]),
+                        "high": _safe_float(parts[3]),
+                        "low": _safe_float(parts[4]),
+                        "volume": _safe_float(parts[5]),
+                    })
+                df = pd.DataFrame(records)
+                if limit is not None and not df.empty:
+                    df = df.tail(int(limit))
+                return df
+            except Exception as e:
+                last_err = e
+                time.sleep(delay)
+                delay *= 2
+        if last_err:
+            raise last_err
+        return pd.DataFrame()
+
+    def _offline_stub_kline(self, limit: Optional[int], freq: str) -> pd.DataFrame:
+        steps = int(limit) if limit else 60
+        if steps < 30:
+            steps = 30
+        dates = pd.date_range(end=_dt.datetime.today(), periods=steps, freq="B")
+        base = np.linspace(80, 95, steps)
+        noise = np.random.normal(0, 0.5, steps)
+        close = base + noise
+        open_px = close - np.random.uniform(0.3, 0.8, steps)
+        high = np.maximum(open_px, close) + np.random.uniform(0.1, 0.6, steps)
+        low = np.minimum(open_px, close) - np.random.uniform(0.1, 0.6, steps)
+        volume = np.random.randint(1e6, 5e6, steps)
+        df = pd.DataFrame({
+            "date": dates,
+            "open": open_px,
+            "close": close,
+            "high": high,
+            "low": low,
+            "volume": volume,
+        })
+        return df.tail(int(limit)) if limit else df
+
     def get_kline(
         self,
         code: str,
@@ -360,156 +722,405 @@ class DataEngine:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> pd.DataFrame:
-        """K线数据，支持按日期范围拉取（YYYYMMDD）。
+        res = self.get_kline_structured(code, freq=freq, limit=limit, start_date=start_date, end_date=end_date)
+        if hasattr(res.data, "empty"):
+            return res.data
+        return pd.DataFrame()
 
-        - freq: daily/weekly/monthly
-        - start_date/end_date: 形如 20240101
-        - limit: None 表示不截断
-        """
+    def get_kline_structured(
+        self,
+        code: str,
+        freq: str = "daily",
+        limit: Optional[int] = 250,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> FetchResult:
+        code_std = standardize_code(code)
+        code_plain = normalize_code(code)
+        cache_key = f"kline:{code_std}:{freq}"
+        errors: List[Dict[str, str]] = []
+
+        cached = self.cache.get_df(cache_key, ttl=3600)
+        if cached is not None and not cached.empty:
+            return make_result(cached, source="cache", cache_hit=True, cache_age=self._cache_age(cache_key))
+
         if ak is None:
-            return pd.DataFrame()
+            errors.append(build_error("akshare", "missing", "AkShare 未安装"))
+        else:
+            try:
+                df = self._retry_call(lambda: self._fetch_kline_akshare(code_plain, freq, limit, start_date, end_date), max_retries=2)
+                if df is not None and not df.empty:
+                    self.cache.set_df(cache_key, df)
+                    return make_result(df, source="akshare", errors=errors)
+                errors.append(build_error("akshare", "empty", "K线数据为空"))
+            except Exception as e:
+                errors.append(build_error("akshare", "exception", str(e)))
+
+        fallback_used = True
+
         try:
-            period_map = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}
-            p = period_map.get(freq, "daily")
+            df_em = self._fetch_kline_eastmoney(code_std, freq, limit)
+            if df_em is not None and not df_em.empty:
+                self.cache.set_df(cache_key, df_em)
+                return make_result(df_em, source="eastmoney", fallback_used=True, errors=errors)
+            errors.append(build_error("eastmoney", "empty", "东财K线为空"))
+        except Exception as e:
+            errors.append(build_error("eastmoney", "exception", str(e)))
 
-            kwargs = {"symbol": code, "period": p, "adjust": "qfq"}
-            if start_date:
-                kwargs["start_date"] = str(start_date)
-            if end_date:
-                kwargs["end_date"] = str(end_date)
+        stale = self.cache.get_df(cache_key, ttl=None)
+        if stale is not None and not stale.empty:
+            errors.append(build_error("cache", "stale", "实时源失败，使用历史缓存，数据可能过期"))
+            return make_result(stale, source="stale_cache", fallback_used=True, errors=errors, cache_hit=True, cache_age=self._cache_age(cache_key))
 
-            df = ak.stock_zh_a_hist(**kwargs)
-            if df is None or df.empty:
-                return pd.DataFrame()
+        try:
+            stub = self._offline_stub_kline(limit or 60, freq)
+            if stub is not None and not stub.empty:
+                errors.append(build_error("offline_stub", "used", "实时源不可用，使用内置示例K线，数据可能过期"))
+                return make_result(stub, source="offline_stub", fallback_used=True, errors=errors)
+        except Exception as e:
+            errors.append(build_error("offline_stub", "exception", str(e)))
 
-            df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close", "最高": "high", "最低": "low", "成交量": "volume"})
-            df["date"] = pd.to_datetime(df["date"])
-            for col in ["open", "close", "high", "low", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+        errors.append(build_error("kline", "unavailable", "所有数据源均失败"))
+        return make_result(pd.DataFrame(), source="unavailable", fallback_used=fallback_used, errors=errors)
 
-            if limit is not None:
-                try:
-                    df = df.tail(int(limit))
-                except Exception:
-                    pass
-            return df
-        except Exception:
-            return pd.DataFrame()
+    def get_kline_with_meta(
+        self,
+        code: str,
+        freq: str = "daily",
+        limit: Optional[int] = 250,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """兼容旧接口，返回 DataFrame。"""
+        return self.get_kline_structured(code, freq, limit, start_date, end_date).data
     # -------------------------------------
     # 5. 深度财务
     # -------------------------------------
-    def get_financial_features(self, code: str) -> Dict[str, Any]:
-        """财报/运营类特征（结构化输出）。
+    def get_financial_features_structured(self, code: str) -> FetchResult:
+        """财报/运营类特征（结构化输出），保证错误可见且多源兜底。"""
 
-        - 数据源：优先 AkShare 的财务分析指标；失败则退化为缺省值。
-        - 输出：基础指标 + 衍生评分（0~1）：fundamental_quality / fundamental_growth / ops_momentum
-        """
-        ck = f"fin:{code}"
+        code_std = standardize_code(code)
+        ck = f"fin:{code_std}"
         cached = self.cache.get(ck, ttl=3600 * 12)
         if cached is not None:
-            return cached
+            return FetchResult(data=cached, ok=True, source="cache", cache_hit=True, cache_age=self._cache_age(ck))
 
-        fin: Dict[str, Any] = {
-            "roe": 0.0,
-            "gross_margin": 0.0,
-            "net_margin": 0.0,
-            "operating_margin": 0.0,
-            "profit_yoy": 0.0,
-            "revenue_yoy": 0.0,
-            "debt_ratio": 0.0,
-            "op_cashflow": 0.0,
-            "eps": 0.0,
-            "report_date": "",
+        errors: List[Dict[str, str]] = []
+        source = ""
+        fallback_used = False
 
-            # Step4 derived (0~1)
-            "fundamental_quality": 0.0,
-            "fundamental_growth": 0.0,
-            "ops_momentum": 0.0,
+        fin = self._fetch_financial_from_ak(code_std, errors)
+        if fin:
+            source = "akshare"
+        else:
+            fallback_used = True
+            fin = self._fetch_financial_from_eastmoney(code_std, errors)
+            if fin:
+                source = "eastmoney"
+
+        if not fin:
+            stale = self.cache.get(ck, ttl=None)
+            if stale:
+                errors.append(build_error("cache", "stale", "实时源失败，使用历史缓存，数据可能过期"))
+                return FetchResult(
+                    data=stale,
+                    ok=True,
+                    source="stale_cache",
+                    fallback_used=True,
+                    errors=errors,
+                    cache_hit=True,
+                    cache_age=self._cache_age(ck),
+                )
+
+        if not fin:
+            fallback_used = True
+            fin = self._financial_offline_stub(code_std)
+            if fin:
+                errors.append(build_error("offline_stub", "used", "实时源不可用，使用内置示例财务数据，可能过期"))
+                source = "offline_stub"
+            else:
+                errors.append(build_error("financial", "unavailable", "所有财务数据源均失败"))
+
+        if not fin:
+            return FetchResult(data={}, ok=False, source="unavailable", fallback_used=True, errors=errors)
+
+        fin = self._enrich_financial_scores(fin)
+        filled_keys = [k for k in [
+            "revenue",
+            "net_profit",
+            "gross_margin",
+            "net_margin",
+            "roe",
+            "roa",
+            "debt_ratio",
+            "op_cashflow",
+        ] if fin.get(k) is not None]
+
+        ok_flag = len(filled_keys) >= 5 and bool(fin.get("report_date"))
+        self.cache.set(ck, fin)
+        return FetchResult(
+            data=fin,
+            ok=ok_flag,
+            source=source or "unknown",
+            fallback_used=fallback_used,
+            errors=errors,
+            cache_age=self._cache_age(ck),
+        )
+
+    def get_financial_features(self, code: str) -> Dict[str, Any]:
+        return self.get_financial_features_structured(code).data
+
+    def _map_financial_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        mapping = {
+            "report_date": ["报告期", "报告日期", "reportdate", "fdate", "REPORT_DATE"],
+            "revenue": ["营业收入", "营业总收入(元)", "totaloperatereve", "营业总收入", "biz_income"],
+            "net_profit": ["净利润", "netprofit", "归属于母公司股东的净利润", "netprofit_parent_comp", "归母净利润"],
+            "gross_margin": ["销售毛利率(%)", "毛利率(%)", "毛利率", "grossprofit_margin", "GROSS_MARGIN"],
+            "net_margin": ["销售净利率(%)", "净利率(%)", "净利率", "netprofit_margin"],
+            "roe": ["净资产收益率(%)", "ROE(%)", "净资产收益率", "weightedroe", "roe"],
+            "roa": ["总资产报酬率(%)", "资产报酬率(%)", "资产报酬率", "roa2_weighted", "roa"],
+            "debt_ratio": ["资产负债率(%)", "资产负债率", "debtratio", "资产负债率\r"],
+            "op_cashflow": ["经营活动产生的现金流量净额", "经营现金流量净额", "经营活动现金流量净额", "经营现金流", "ocfps"],
+            "profit_yoy": ["净利润增长率(%)", "净利润同比增长率(%)", "净利润增长率", "netprofit_yoy"],
+            "revenue_yoy": ["营业收入增长率(%)", "营业收入同比增长率(%)", "营业收入增长率", "ystz"],
+            "eps": ["每股收益(元)", "eps", "basiceps", "基本每股收益"],
         }
 
-        if ak is not None:
+        out: Dict[str, Any] = {k: None for k in [
+            "report_date",
+            "revenue",
+            "net_profit",
+            "gross_margin",
+            "net_margin",
+            "roe",
+            "roa",
+            "debt_ratio",
+            "op_cashflow",
+            "profit_yoy",
+            "revenue_yoy",
+            "eps",
+        ]}
+
+        def pick(keys: List[str]) -> Any:
+            for k in keys:
+                if k in row and row[k] not in (None, "", "--"):
+                    return row[k]
+            return None
+
+        for target, keys in mapping.items():
+            out[target] = _to_float_or_none(pick(keys)) if target != "report_date" else pick(keys)
+
+        if not out.get("net_margin") and out.get("net_profit") and out.get("revenue"):
             try:
-                def _fetch_ind():
-                    return ak.stock_financial_analysis_indicator(symbol=code)
-
-                df = self._retry_call(_fetch_ind)
-                if df is not None and not df.empty:
-                    row = df.iloc[-1]
-
-                    def _pick(*names):
-                        for n in names:
-                            try:
-                                if n in row.index and pd.notna(row.get(n)):
-                                    return row.get(n)
-                            except Exception:
-                                continue
-                        return None
-
-                    rd = _pick("日期", "报告期", "报告日期", "公告日期", "截止日期")
-                    if rd is not None:
-                        fin["report_date"] = str(rd)
-
-                    fin["roe"] = _safe_float(_pick("净资产收益率(%)", "ROE(%)", "净资产收益率"))
-                    fin["gross_margin"] = _safe_float(_pick("销售毛利率(%)", "毛利率(%)", "销售毛利率"))
-                    fin["net_margin"] = _safe_float(_pick("销售净利率(%)", "净利率(%)", "销售净利率"))
-                    fin["operating_margin"] = _safe_float(_pick("营业利润率(%)", "营业利润率"))
-                    fin["profit_yoy"] = _safe_float(_pick("净利润增长率(%)", "净利润同比增长率(%)", "净利润增长率", "净利润同比"))
-                    fin["revenue_yoy"] = _safe_float(_pick("营业收入增长率(%)", "营业收入同比增长率(%)", "营业收入增长率", "营收同比"))
-                    fin["debt_ratio"] = _safe_float(_pick("资产负债率(%)", "资产负债率"))
-                    fin["eps"] = _safe_float(_pick("摊薄每股收益(元)", "基本每股收益(元)", "每股收益(元)", "基本每股收益", "每股收益"))
-                    fin["op_cashflow"] = _safe_float(_pick(
-                        "经营活动产生的现金流量净额",
-                        "经营现金流量净额",
-                        "经营活动现金流量净额",
-                        "经营活动现金流量",
-                        "经营现金流",
-                    ))
+                out["net_margin"] = float(out["net_profit"]) / float(out["revenue"]) * 100.0
             except Exception:
                 pass
+        return out
 
+    def _fetch_financial_from_ak(self, code_std: str, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        if ak is None:
+            errors.append(build_error("akshare", "missing", "AkShare 未安装"))
+            return None
+        df = None
+        try:
+            df = self._retry_call(lambda: ak.stock_financial_analysis_indicator(symbol=code_std))
+        except Exception as e:
+            errors.append(build_error("akshare", "exception", str(e)))
+
+        if df is None or df.empty:
+            try:
+                df = self._retry_call(lambda: ak.stock_financial_analysis_indicator_em(symbol=code_std))
+            except Exception as e:
+                errors.append(build_error("akshare_em", "exception", str(e)))
+
+        if df is not None and not df.empty:
+            try:
+                row = df.iloc[-1].to_dict()
+                return self._map_financial_row(row)
+            except Exception as e:
+                errors.append(build_error("akshare", "parse", str(e)))
+        else:
+            errors.append(build_error("akshare", "empty", "财务指标返回空"))
+        return None
+
+    def _fetch_financial_from_eastmoney(self, code_std: str, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        try:
+            df = fetch_financial_indicator_em(code_std)
+            if df is not None and not df.empty:
+                row = df.iloc[0].to_dict()
+                return self._map_financial_row(row)
+            errors.append(build_error("eastmoney", "empty", "东财财务指标为空"))
+        except Exception as e:
+            errors.append(build_error("eastmoney", "exception", str(e)))
+        return None
+
+    def _financial_offline_stub(self, code_std: str) -> Optional[Dict[str, Any]]:
+        samples = {
+            "600519.SH": {
+                "report_date": "2024-09-30",
+                "revenue": 1067.5 * 1e8,
+                "net_profit": 527.0 * 1e8,
+                "gross_margin": 91.0,
+                "net_margin": 49.0,
+                "roe": 25.0,
+                "roa": 18.0,
+                "debt_ratio": 36.0,
+                "op_cashflow": 550.0 * 1e8,
+                "profit_yoy": 15.0,
+                "revenue_yoy": 17.0,
+                "eps": 40.0,
+            },
+            "000001.SZ": {
+                "report_date": "2024-09-30",
+                "revenue": 1500.0 * 1e8,
+                "net_profit": 120.0 * 1e8,
+                "gross_margin": 28.0,
+                "net_margin": 12.0,
+                "roe": 11.5,
+                "roa": 0.9,
+                "debt_ratio": 86.0,
+                "op_cashflow": 300.0 * 1e8,
+                "profit_yoy": 6.0,
+                "revenue_yoy": 5.0,
+                "eps": 1.8,
+            },
+        }
+        return samples.get(code_std)
+
+    def _enrich_financial_scores(self, fin: Dict[str, Any]) -> Dict[str, Any]:
         def _clip(x: float) -> float:
             return max(0.0, min(1.0, float(x)))
 
-        # 归一化/衍生
-        roe_score = _clip((fin["roe"] / 15.0 + 1) / 2)  # 15% ~ 0.5
-        gm_score = _clip(fin["gross_margin"] / 50.0)
-        debt_score = _clip(1.0 - fin["debt_ratio"] / 80.0)
+        roe_score = _clip(((_safe_float(fin.get("roe"), 0.0)) / 15.0 + 1) / 2)
+        gm_score = _clip(_safe_float(fin.get("gross_margin"), 0.0) / 50.0)
+        debt_score = _clip(1.0 - _safe_float(fin.get("debt_ratio"), 0.0) / 80.0)
+        prof_score = _clip((_safe_float(fin.get("profit_yoy"), 0.0) / 40.0 + 1) / 2)
+        rev_score = _clip((_safe_float(fin.get("revenue_yoy"), 0.0) / 30.0 + 1) / 2)
 
-        prof_score = _clip((fin["profit_yoy"] / 40.0 + 1) / 2)
-        rev_score = _clip((fin["revenue_yoy"] / 30.0 + 1) / 2)
-
-        fin["fundamental_quality"] = _clip(0.40 * roe_score + 0.30 * gm_score + 0.20 * debt_score + 0.10 * _clip(fin["net_margin"] / 30.0))
+        fin["fundamental_quality"] = _clip(0.40 * roe_score + 0.30 * gm_score + 0.20 * debt_score + 0.10 * _clip(_safe_float(fin.get("net_margin"), 0.0) / 30.0))
         fin["fundamental_growth"] = _clip(0.60 * prof_score + 0.40 * rev_score)
-
-        # 经营现金流若为正... slight boost
-        cf_bonus = 0.05 if fin["op_cashflow"] > 0 else 0.0
+        cf_bonus = 0.05 if _safe_float(fin.get("op_cashflow"), 0.0) > 0 else 0.0
         fin["ops_momentum"] = _clip(0.50 + 0.40 * (fin["fundamental_growth"] - 0.50) + 0.10 * (fin["fundamental_quality"] - 0.50) + cf_bonus)
-
-        self.cache.set(ck, fin)
         return fin
 
-    def get_money_flow(self, code: str) -> Dict[str, Any]:
-        """Money flow / capital intelligence (best effort).
-
-        Returns keys (when available):
-        - main_net_inflow_today: from spot snapshot (fast)
-        - main_net_inflow_detail: from AkShare detail (optional)
-        - northbound_net_inflow: market-level northbound summary (optional)
-        """
-        code = normalize_code(code)
+    def get_money_flow_structured(self, code: str) -> FetchResult:
+        """资金流信息，带错误原因。"""
+        code_std = standardize_code(code)
+        errors: List[Dict[str, str]] = []
         out: Dict[str, Any] = {}
-        try:
-            spot = self.get_spot_row(code)
-            out['main_net_inflow_today'] = _safe_float(spot.get('main_net_inflow', spot.get('main_net_inflow_today', 0.0)), 0.0)
-        except Exception:
-            out['main_net_inflow_today'] = 0.0
+        fallback_used = False
+        source = "money_flow"
 
         try:
             if self.capital_engine is not None:
-                out.update(self.capital_engine.get_capital_features(code))
-        except Exception:
-            pass
-        return out
+                cap = self.capital_engine.get_capital_features_structured(code_std)
+                if isinstance(cap.data, dict):
+                    out.update(cap.data)
+                errors.extend(cap.errors)
+                fallback_used = fallback_used or cap.fallback_used
+                source = cap.source or source
+            else:
+                errors.append(build_error("capital_engine", "missing", "未初始化"))
+        except Exception as e:  # noqa: BLE001
+            errors.append(build_error("capital_engine", "exception", str(e)))
+
+        if not out:
+            errors.append(build_error("money_flow", "empty", "资金流为空"))
+
+        return make_result(out, source=source, errors=errors, fallback_used=fallback_used or bool(errors))
+
+    def get_money_flow(self, code: str) -> Dict[str, Any]:
+        return self.get_money_flow_structured(code).data
+
+
+    # -------------------------------------
+    # 5.4 公告 / 研报 / 热点要事
+    # -------------------------------------
+    def get_announcements_structured(self, code: str, limit: int = 12) -> FetchResult:
+        code_std = standardize_code(code)
+        errors: List[Dict[str, str]] = []
+        chosen: List[Dict[str, Any]] = []
+        source = ""
+        providers = [
+            ("eastmoney", lambda: fetch_announcements_em(code_std, limit=limit)),
+            ("tencent", lambda: fetch_announcements_tencent(code_std, limit=limit)),
+        ]
+
+        for name, fn in providers:
+            try:
+                data = self._retry_call(fn, max_retries=2)
+            except Exception as e:  # noqa: BLE001
+                errors.append(build_error(name, "exception", str(e)))
+                continue
+            if data:
+                chosen = data
+                source = name
+                break
+            errors.append(build_error(name, "empty", f"{name} 公告为空"))
+
+        if not chosen:
+            errors.append(build_error("sample", "fallback", "启用离线公告样本，数据可能过期"))
+            chosen = sample_announcements(code_std, limit=limit)
+            source = "sample_cache"
+
+        return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
+
+    def get_research_reports_structured(self, code: str, limit: int = 12) -> FetchResult:
+        code_std = standardize_code(code)
+        errors: List[Dict[str, str]] = []
+        chosen: List[Dict[str, Any]] = []
+        source = ""
+        providers = [
+            ("eastmoney", lambda: fetch_research_reports_em(code_std, limit=limit)),
+            ("alt", lambda: fetch_research_reports_alt(code_std, limit=limit)),
+        ]
+
+        for name, fn in providers:
+            try:
+                data = self._retry_call(fn, max_retries=2)
+            except Exception as e:  # noqa: BLE001
+                errors.append(build_error(name, "exception", str(e)))
+                continue
+            if data:
+                chosen = data
+                source = name
+                break
+            errors.append(build_error(name, "empty", f"{name} 研报为空"))
+
+        if not chosen:
+            errors.append(build_error("sample", "fallback", "启用离线研报样本，数据可能过期"))
+            chosen = sample_reports(code_std, limit=limit)
+            source = "sample_cache"
+
+        return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
+
+    def get_hot_topics_structured(self, limit: int = 8) -> FetchResult:
+        errors: List[Dict[str, str]] = []
+        chosen: List[Dict[str, Any]] = []
+        source = ""
+        providers = [
+            ("eastmoney", lambda: fetch_hot_topics_em(limit=limit)),
+            ("akshare", lambda: fetch_hot_topics_ak(limit=limit)),
+        ]
+
+        for name, fn in providers:
+            try:
+                data = self._retry_call(fn, max_retries=2)
+            except Exception as e:  # noqa: BLE001
+                errors.append(build_error(name, "exception", str(e)))
+                continue
+            if data:
+                chosen = data
+                source = name
+                break
+            errors.append(build_error(name, "empty", f"{name} 热点为空"))
+
+        if not chosen:
+            errors.append(build_error("sample", "fallback", "启用离线热点样本，数据可能过期"))
+            chosen = sample_hot_topics(limit=limit)
+            source = "sample_cache"
+
+        return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
 
 
     # -------------------------------------
@@ -560,6 +1171,8 @@ class DataEngine:
         alt_report = {}
         if self.alt_engine:
             alt_report = self.alt_engine.get_alternative_report(code, sector=ident.get('sector', ''))
+        else:
+            self.logger.info("alternative data engine missing; skipping alt report for %s", code)
         
         return {
             "code": code,

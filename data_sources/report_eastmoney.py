@@ -7,6 +7,27 @@ from typing import Any, Dict, List
 
 import requests
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Referer": "https://data.eastmoney.com/",
+}
+
+
+def _request_json(url: str, timeout: int = 10, retries: int = 1) -> Dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries + 1)):
+        try:
+            resp = requests.get(url, timeout=timeout, headers=HEADERS, proxies={"http": None, "https": None})
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(0.3 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+    return {}
+
 
 def _standardize_code(code: str) -> str:
     code = str(code).strip().upper()
@@ -31,9 +52,7 @@ def fetch_research_reports_em(code: str, limit: int = 20, timeout: int = 10) -> 
         "https://reportapi.eastmoney.com/report/list?"
         f"code={plain}&pageSize={limit}&pageNo=1&industryCode="
     )
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
+    payload = _request_json(url, timeout=timeout)
     items = payload.get("data", []) if isinstance(payload, dict) else []
     out: List[Dict[str, Any]] = []
     for it in items:
@@ -54,10 +73,10 @@ def fetch_research_reports_alt(code: str, limit: int = 15, timeout: int = 10) ->
     std = _standardize_code(code)
     plain = std.split(".")[0]
     url = f"https://emdata.eastmoney.com/stock/research/{plain}.json"
-    resp = requests.get(url, timeout=timeout)
-    if resp.status_code != 200:
+    try:
+        payload = _request_json(url, timeout=timeout)
+    except Exception:
         return []
-    payload = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
     data = payload.get("data", []) if isinstance(payload, dict) else []
     out: List[Dict[str, Any]] = []
     for row in data[:limit]:

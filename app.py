@@ -12,10 +12,11 @@ app.py
 
 import os
 import re
-from datetime import datetime
-from config_manager import get_config, update_keys, test_deepseek, test_tavily
-import pandas as pd
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional
+
 import numpy as np
+from config_manager import get_config, update_keys, test_deepseek, test_tavily
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -41,6 +42,33 @@ except Exception:
     save_weights = None
     load_weights = None
     run_factor_backtest = None
+
+
+# Optional pandas import to avoid pyarrow MemoryError on constrained hosts
+_PD_REF: Optional[Any] = None
+_PD_ERROR: Optional[str] = None
+
+
+def _get_pandas():
+    global _PD_REF, _PD_ERROR
+    if _PD_REF is not None or _PD_ERROR is not None:
+        return _PD_REF
+    try:
+        import pandas as pd  # type: ignore
+
+        _PD_REF = pd
+    except (ImportError, MemoryError) as exc:  # noqa: PIE786
+        _PD_ERROR = f"{exc.__class__.__name__}: {exc}"
+        _PD_REF = None
+    return _PD_REF
+
+
+def _pd_available() -> bool:
+    return _get_pandas() is not None
+
+
+def _pd_error_message() -> Optional[str]:
+    return _PD_ERROR
 
 
 # ==========================================
@@ -115,6 +143,12 @@ os.environ["FORCE_REFRESH"] = "1" if force_refresh else "0"
 st.session_state["offline_mode_flag"] = offline_mode
 st.session_state["sample_mode"] = sample_mode
 st.session_state["force_refresh"] = force_refresh
+
+pd_err_msg = _pd_error_message()
+if pd_err_msg:
+    st.sidebar.warning(
+        "pandas 未加载，已切换为纯 Python 表格展示。错误: {}".format(pd_err_msg)
+    )
 
 # 初始化引擎 (单例模式)
 if "init_done" not in st.session_state:
@@ -258,7 +292,13 @@ def _render_meta(meta: dict | None):
     )
 
 
-def _minmax_norm(s: pd.Series) -> pd.Series:
+def _minmax_norm(s):
+    pd = _get_pandas()
+    if pd is None:
+        try:
+            return [0.5] * len(s)
+        except Exception:
+            return []
     s = pd.to_numeric(s, errors="coerce").fillna(0.0)
     if len(s) == 0:
         return s
@@ -268,7 +308,7 @@ def _minmax_norm(s: pd.Series) -> pd.Series:
     return (s - mn) / (mx - mn)
 
 
-def compute_entry_scores(df: pd.DataFrame) -> pd.DataFrame:
+def compute_entry_scores(df):
     """Compute entry_score for 'build position now' list.
 
     商用化闭环（Step4）：
@@ -276,7 +316,8 @@ def compute_entry_scores(df: pd.DataFrame) -> pd.DataFrame:
     - 使用权重学习输出 .w5brain_weights.json
     - 这里自动加载权重，把“慢变量”转成可迭代的建仓评分
     """
-    if df is None or df.empty:
+    pd = _get_pandas()
+    if pd is None or df is None or getattr(df, "empty", True):
         return df
     d = df.copy()
     base_col = "fused_score" if "fused_score" in d.columns else "score"
@@ -639,7 +680,11 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                     "errors_count": _errors_count(safe_meta.get("errors")),
                 })
             if diag_rows:
-                st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+                pd = _get_pandas()
+                if pd is not None:
+                    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+                else:
+                    st.table(diag_rows)
             for label, meta in [
                 ("行情", quote_meta),
                 ("身份", identity_meta),
@@ -759,8 +804,13 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 if not items:
                     continue
                 st.markdown(f"**{label} ({len(items)})**")
-                df_show = pd.DataFrame(items)[[c for c in ["title", "time", "source", "url", "summary"] if c in pd.DataFrame(items).columns]].head(5)
-                st.dataframe(df_show, use_container_width=True)
+                pd = _get_pandas()
+                if pd is not None:
+                    df_temp = pd.DataFrame(items)
+                    cols = [c for c in ["title", "time", "source", "url", "summary"] if c in df_temp.columns]
+                    st.dataframe(df_temp[cols].head(5), use_container_width=True)
+                else:
+                    st.table(items[:5])
             _render_meta(news_meta)
             if not (news_meta or {}).get("ok"):
                 _render_errors((news_meta or {}).get("errors"))
@@ -818,9 +868,9 @@ elif mode == "📦 模拟仓 (Paper Portfolio)":
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        start = st.date_input("开始日期", value=pd.to_datetime("2023-01-01"))
+        start = st.date_input("开始日期", value=datetime.fromisoformat("2023-01-01").date())
     with c2:
-        end = st.date_input("结束日期", value=pd.to_datetime("today"))
+        end = st.date_input("结束日期", value=datetime.today().date())
     with c3:
         initial_cash = st.number_input("初始资金", min_value=10000, value=1000000, step=10000)
 
@@ -868,14 +918,18 @@ elif mode == "📦 模拟仓 (Paper Portfolio)":
                 st.plotly_chart(fig, use_container_width=True)
 
             trades = res.get("trades")
-            if trades is not None and not trades.empty:
+            if trades is not None and not getattr(trades, "empty", True):
                 st.subheader("交易记录")
                 st.dataframe(trades, use_container_width=True, height=320)
 
             pos = res.get("positions")
             if pos is not None and len(pos):
                 st.subheader("期末持仓")
-                st.dataframe(pd.DataFrame(pos).sort_values("weight", ascending=False), use_container_width=True, height=260)
+                pd = _get_pandas()
+                if pd is not None:
+                    st.dataframe(pd.DataFrame(pos).sort_values("weight", ascending=False), use_container_width=True, height=260)
+                else:
+                    st.table(pos)
 
 elif mode == "📊 策略回测 (Time Machine)":
     st.title("📊 五维超脑·时光机")
@@ -893,8 +947,8 @@ elif mode == "📊 策略回测 (Time Machine)":
 
         c1, c2, c3, c4 = st.columns(4)
         bt_code = c1.text_input("回测标的", "600519")
-        bt_start = c2.date_input("开始日期", value=pd.to_datetime("2023-01-01"))
-        bt_end = c3.date_input("结束日期", value=pd.to_datetime("2023-12-31"))
+        bt_start = c2.date_input("开始日期", value=datetime.fromisoformat("2023-01-01").date())
+        bt_end = c3.date_input("结束日期", value=datetime.fromisoformat("2023-12-31").date())
         bt_cash = c4.number_input("初始资金", value=100000)
 
         if st.button("🔴 启动单股回测", type="primary"):
@@ -913,10 +967,15 @@ elif mode == "📊 策略回测 (Time Machine)":
             with st.status("时光倒流中...", expanded=True):
                 runner.run()
             if getattr(runner, 'history', None):
-                df_res = pd.DataFrame(runner.history)
-                st.dataframe(df_res, use_container_width=True)
-                if 'date' in df_res.columns and 'total' in df_res.columns:
-                    st.line_chart(df_res.set_index('date')['total'])
+                pd = _get_pandas()
+                history = runner.history
+                if pd is not None:
+                    df_res = pd.DataFrame(history)
+                    st.dataframe(df_res, use_container_width=True)
+                    if 'date' in df_res.columns and 'total' in df_res.columns:
+                        st.line_chart(df_res.set_index('date')['total'])
+                else:
+                    st.table(history)
 
     with t2:
         st.subheader("权重学习 (Ridge Regression)")
@@ -927,7 +986,7 @@ elif mode == "📊 策略回测 (Time Machine)":
         else:
             colA, colB, colC, colD = st.columns(4)
             f_start = colA.text_input("样本开始", "2023-01-01")
-            f_end = colB.text_input("样本结束", pd.Timestamp.today().strftime("%Y-%m-%d"))
+            f_end = colB.text_input("样本结束", datetime.today().strftime("%Y-%m-%d"))
             horizon = int(colC.number_input("预测周期(天)", value=5, min_value=1, max_value=60))
             l2 = float(colD.number_input("L2强度(Ridge)", value=10.0, min_value=0.0))
 
@@ -968,7 +1027,7 @@ elif mode == "📊 策略回测 (Time Machine)":
         else:
             c1, c2, c3, c4, c5 = st.columns(5)
             bt_start2 = c1.text_input("开始", "2023-01-01")
-            bt_end2 = c2.text_input("结束", pd.Timestamp.today().strftime("%Y-%m-%d"))
+            bt_end2 = c2.text_input("结束", datetime.today().strftime("%Y-%m-%d"))
             horizon2 = int(c3.number_input("持有(天)", value=5, min_value=1, max_value=60))
             topk = int(c4.number_input("TopK", value=20, min_value=5, max_value=100))
             reb = c5.selectbox("调仓", ["W", "D", "M"], index=0)
@@ -994,7 +1053,10 @@ elif mode == "📊 策略回测 (Time Machine)":
                 else:
                     st.success(f"完成：总收益 {out.get('total_return'):.2%} | CAGR≈ {out.get('cagr_approx'):.2%} | MDD {out.get('max_drawdown'):.2%} | 胜率 {out.get('win_rate'):.2%}")
                     curve = out.get('curve')
-                    if isinstance(curve, pd.DataFrame) and not curve.empty:
+                    pd = _get_pandas()
+                    if pd is not None and isinstance(curve, pd.DataFrame) and not curve.empty:
                         st.dataframe(curve, use_container_width=True)
                         if 'date' in curve.columns and 'equity' in curve.columns:
                             st.line_chart(curve.set_index('date')['equity'])
+                    elif curve:
+                        st.table(curve)

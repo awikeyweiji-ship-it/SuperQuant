@@ -16,11 +16,21 @@ if ROOT not in sys.path:
 from data_engine import DataEngine, standardize_code
 from universe_cache import UniverseCache
 
+NETWORK_KEYWORDS = [
+    "network is unreachable",
+    "connection refused",
+    "timed out",
+    "max retries",
+    "proxy",
+]
+
 
 def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
     diag = stock.get("diagnostics") or []
     meta = stock.get("_meta") or {}
     failures: List[str] = []
+    module_results: List[Dict[str, Any]] = []
+    provider_trace = stock.get("provider_trace") or {}
 
     def _get_meta(name: str) -> Dict[str, Any]:
         val = meta.get(name, {}) if isinstance(meta, dict) else {}
@@ -45,8 +55,32 @@ def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
         info = diag_map.get(module, {})
         filled = info.get("filled") or 0
         err_cnt = info.get("errors_count") or 0
-        if filled == 0 or err_cnt > 0:
-            failures.append(f"{module}_unavailable")
+        traces = provider_trace.get(module) if isinstance(provider_trace, dict) else []
+        status = "OK"
+        module_failures: List[str] = []
+        if filled == 0:
+            module_failures.append(f"{module}_filled_zero")
+        if err_cnt > 0:
+            module_failures.append(f"{module}_errors_{err_cnt}")
+        for tr in traces or []:
+            msg_blob = json.dumps(tr, ensure_ascii=False).lower()
+            if any(kw in msg_blob for kw in NETWORK_KEYWORDS):
+                status = "INCONCLUSIVE"
+                if f"{module}_network_blocked" not in module_failures:
+                    module_failures.append(f"{module}_network_blocked")
+        if module_failures:
+            status = "FAIL" if status == "OK" else status
+            failures.extend(module_failures)
+        module_results.append(
+            {
+                "module": module,
+                "filled_metrics": filled,
+                "errors_count": err_cnt,
+                "status": status,
+                "provider_trace": traces,
+                "missing_paths": info.get("missing_paths") or [],
+            }
+        )
 
     # news bundle basic schema
     nb = stock.get("news_bundle") or {}
@@ -60,7 +94,7 @@ def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
                         failures.append(f"news_{key}_missing_{req}")
             else:
                 failures.append(f"news_{key}_empty")
-    return {"diagnostics": diag, "failures": failures}
+    return {"diagnostics": diag, "failures": failures, "module_results": module_results}
 
 
 def main() -> int:
@@ -73,8 +107,15 @@ def main() -> int:
         code_std = standardize_code(raw)
         stock = engine.single_stock(code_std)
         validation = validate_payload(stock)
+        module_results = validation.get("module_results") or []
+        entry = {
+            "code": code_std,
+            "failures": validation.get("failures"),
+            "diagnostics": validation.get("diagnostics"),
+            "module_results": module_results,
+        }
+        reports.append(entry)
         any_failures = any_failures or bool(validation.get("failures"))
-        reports.append({"code": code_std, "failures": validation.get("failures"), "diagnostics": validation.get("diagnostics")})
 
     print(json.dumps(reports, ensure_ascii=False, indent=2))
     return 1 if any_failures else 0

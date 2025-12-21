@@ -77,6 +77,7 @@ def run_providers_parallel(
                     meta.setdefault("retrieved_at", time.time())
                     meta.setdefault("errors", [])
                     meta.setdefault("filled_metrics", 0)
+                    meta.setdefault("errors_count", len(meta.get("errors") or []))
                     traces.append(
                         {
                             "provider": entry.name,
@@ -84,6 +85,7 @@ def run_providers_parallel(
                             "elapsed": meta.get("elapsed") or meta.get("duration") or elapsed,
                             "errors": meta.get("errors", []),
                             "filled_metrics": meta.get("filled_metrics", 0),
+                            "errors_count": meta.get("errors_count", len(meta.get("errors") or [])),
                         }
                     )
                     results.append((entry, payload))
@@ -93,6 +95,7 @@ def run_providers_parallel(
                         "success": False,
                         "elapsed": None,
                         "errors": [{"source": entry.name, "error_type": "exception", "message": str(exc)}],
+                        "errors_count": 1,
                         "filled_metrics": 0,
                     })
         except concurrent.futures.TimeoutError:
@@ -104,6 +107,7 @@ def run_providers_parallel(
                     "success": False,
                     "elapsed": timeout,
                     "errors": [{"source": entry.name, "error_type": "timeout", "message": f">={timeout}s"}],
+                    "errors_count": 1,
                     "filled_metrics": 0,
                 })
 
@@ -120,7 +124,7 @@ def run_providers_parallel(
             ts = float(ts_raw)
         except Exception:
             ts = 0
-        return (filled, -err_cnt, ts, entry.priority)
+        return (filled, -err_cnt, entry.priority, ts)
 
     best_entry, best_payload = sorted(results, key=_score, reverse=True)[0]
     meta = best_payload.get("meta") or {}

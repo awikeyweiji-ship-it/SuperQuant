@@ -26,8 +26,22 @@ site_paths = [p for p in sys.path if "site-packages" in p]
 other_paths = [p for p in sys.path if p not in site_paths and p != ""]
 sys.path = site_paths + other_paths + [""]
 
-import pandas as pd
-import numpy as np
+PD_IMPORT_ERROR: Optional[str] = None
+NP_IMPORT_ERROR: Optional[str] = None
+
+try:
+    import pandas as pd  # type: ignore
+except (MemoryError, ImportError) as exc:  # noqa: PIE786
+    PD_IMPORT_ERROR = f"{exc.__class__.__name__}: {exc}"
+    pd = None  # type: ignore[assignment]
+else:
+    PD_IMPORT_ERROR = None
+
+try:
+    import numpy as np  # type: ignore
+except Exception as exc:  # noqa: BLE001
+    NP_IMPORT_ERROR = f"{exc.__class__.__name__}: {exc}"
+    np = None  # type: ignore[assignment]
 
 from logging_utils import get_data_logger, make_result, build_error, FetchResult
 from data_sources.provider_registry import ProviderRegistry, run_providers_parallel
@@ -79,20 +93,18 @@ def _now_str() -> str:
 def normalize_code(code: str) -> str:
     code = str(code).strip()
     code = re.sub(r"\.(SH|SZ|BJ|sh|sz|bj)$", "", code)
-    if code.isdigit() and len(code) < 6:
+    if code.isdigit():
         code = code.zfill(6)
-    return code
-
-
-def standardize_code(code: str) -> str:
-    """统一股票代码为 6 位数字 + 交易所后缀格式 (如 600519.SH)。"""
-    code = normalize_code(code)
     market = "SZ"
     if code.startswith("6"):
         market = "SH"
     elif code.startswith(("8", "4")):
         market = "BJ"
     return f"{code}.{market}"
+
+
+# Backward-compatible alias
+standardize_code = normalize_code
 
 
 def to_tencent_symbol(code: str) -> str:
@@ -130,9 +142,14 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 def _to_float_or_none(x: Any) -> Optional[float]:
     try:
-        val = _safe_float(x, default=np.nan)
-        if pd.isna(val):
-            return None
+        default_val = np.nan if np is not None else None
+        val = _safe_float(x, default=default_val) if default_val is not None else _safe_float(x, default=0.0)
+        if np is not None and pd is not None:
+            try:
+                if pd.isna(val):
+                    return None
+            except Exception:
+                pass
         return float(val)
     except Exception:
         return None
@@ -196,19 +213,24 @@ class DataEngine:
 
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
-        if value is pd.NaT:
+        if pd is not None and value is getattr(pd, "NaT", None):
             return None
-        if isinstance(value, (_dt.date, _dt.datetime, pd.Timestamp)):
+        if isinstance(value, (_dt.date, _dt.datetime)):
             try:
                 return value.isoformat()
             except Exception:
                 return str(value)
-        if isinstance(value, (np.generic,)):
+        if pd is not None and isinstance(value, getattr(pd, "Timestamp", ())):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+        if np is not None and isinstance(value, (np.generic,)):
             try:
                 return value.item()
             except Exception:
                 return value.tolist() if hasattr(value, "tolist") else str(value)
-        if isinstance(value, np.ndarray):
+        if np is not None and isinstance(value, np.ndarray):
             try:
                 return [DataEngine._json_safe(v) for v in value.tolist()]
             except Exception:
@@ -1083,6 +1105,13 @@ class DataEngine:
         cache_key = f"kline:{code_std}:{freq}"
         errors: List[Dict[str, str]] = []
 
+        if pd is None or np is None:
+            if PD_IMPORT_ERROR:
+                errors.append(build_error("pandas", "import_error", PD_IMPORT_ERROR))
+            if NP_IMPORT_ERROR:
+                errors.append(build_error("numpy", "import_error", NP_IMPORT_ERROR))
+            return make_result([], source="unavailable", fallback_used=True, errors=errors)
+
         cached = self.cache.get_df(cache_key, ttl=3600)
         if cached is not None and not cached.empty:
             return make_result(cached, source="cache", cache_hit=True, cache_age=self._cache_age(cache_key))
@@ -1790,6 +1819,18 @@ class DataEngine:
             fin_data = financial_payload.get("data", {}) if isinstance(financial_payload, dict) else {}
             money_data = money_payload.get("data", {}) if isinstance(money_payload, dict) else {}
             news_data = news_payload.get("data", {}) if isinstance(news_payload, dict) else {}
+            missing_refs: List[str] = []
+
+            diag_meta_map = {
+                "quote": quote_payload.get("meta", {}),
+                "financial": financial_payload.get("meta", {}),
+                "money_flow": money_payload.get("meta", {}),
+                "news_bundle": news_payload.get("meta", {}),
+            }
+
+            def _add_missing(ref: str, summary: str):
+                missing_refs.append(ref)
+                _add(ref, summary)
 
             def _add(ref: str, summary: str, value: Any = None, url: str = ""):
                 entry = {"ref": ref, "summary": summary}
@@ -1798,6 +1839,26 @@ class DataEngine:
                 if url:
                     entry["url"] = url
                 ev.append(entry)
+
+            # provider trace failures
+            for mod, traces in (provider_trace or {}).items():
+                for tr in traces or []:
+                    if tr.get("success") is False:
+                        errs = tr.get("errors") or []
+                        msg = errs[0].get("message") if errs and isinstance(errs[0], dict) else "provider failure"
+                        _add(f"$.provider_trace.{mod}.{tr.get('provider')}", f"{mod} provider {tr.get('provider')} failed: {msg}")
+
+            # Missing critical fields
+            for key in ["pe_ttm", "pb", "roe", "revenue_yoy", "profit_yoy", "gross_margin", "report_period"]:
+                if fin_data.get(key) in (None, "", "--"):
+                    _add_missing(f"$.financial.{key}", f"财务字段缺失: {key}")
+
+            for key in ["main_net_inflow", "super_large", "large", "mid", "small"]:
+                if money_data.get(key) in (None, "", "--"):
+                    _add_missing(f"$.money_flow.{key}", f"资金流字段缺失: {key}")
+
+            if not news_data.get("announcements") and not news_data.get("reports") and not news_data.get("hot_events"):
+                _add_missing("$.news_bundle", "新闻/公告为空，需补充信息披露")
 
             if quote.get("price") is not None:
                 _add("$.quote.price", f"现价 {quote.get('price')}", quote.get("price"))
@@ -1829,6 +1890,10 @@ class DataEngine:
             if not any(news_data.get(k) for k in ["announcements", "reports", "hot_events"]):
                 _add("$.news_bundle", "新闻/公告缺失，需关注信息披露")
 
+            # Next steps checklist
+            _add("$.next_steps.smoke", "建议重跑 smoke_single_stock <code> 并检查代理/网络")
+            _add("$.next_steps.provider", "确认东财/腾讯接口是否可访问，必要时切换代理")
+
             while len(ev) < 5:
                 _add("$.diagnostics", "关键信息缺失，建议谨慎观望")
 
@@ -1855,13 +1920,17 @@ class DataEngine:
                 score += 1
 
             action = "观望"
-            if score >= 3:
-                action = "买"
-            elif score <= 0:
-                action = "回避" if score < 0 else "观望"
+            module_missing = any((diag_meta_map.get(m, {}).get("filled_metrics") or 0) == 0 for m in diag_meta_map)
+            if not module_missing and not missing_refs:
+                if score >= 3:
+                    action = "买"
+                elif score < 0:
+                    action = "回避"
+                else:
+                    action = "观望"
 
             rationale = "规则决策：估值、盈利、资金、资讯综合打分" if ev else "缺数据默认观望"
-            return {"evidence": ev, "action": action, "rationale": rationale}
+            return {"evidence": ev, "action": action, "rationale": rationale, "missing_paths": missing_refs}
 
         advice_pack = _build_evidence_and_advice()
         evidence_pack = advice_pack.get("evidence", [])

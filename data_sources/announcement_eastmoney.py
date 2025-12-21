@@ -14,19 +14,23 @@ HEADERS = {
 
 
 def _request_json(url: str, timeout: int = 10, retries: int = 1) -> Dict[str, Any]:
+    """Best-effort JSON fetch that never raises.
+
+    When all retries fail, returns a payload carrying the error so callers can
+    surface it in provider traces.
+    """
+
     last_exc: Exception | None = None
     for attempt in range(max(1, retries + 1)):
         try:
-            resp = requests.get(url, timeout=timeout, headers=HEADERS, proxies={"http": None, "https": None})
+            resp = requests.get(url, timeout=timeout, headers=HEADERS)
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < retries:
                 time.sleep(0.3 * (attempt + 1))
-    if last_exc:
-        raise last_exc
-    return {}
+    return {"_error": str(last_exc) if last_exc else "unknown error"}
 
 
 def _standardize_code(code: str) -> str:
@@ -44,8 +48,9 @@ def _standardize_code(code: str) -> str:
     return f"{code}.{market}"
 
 
-def fetch_announcements_em(code: str, limit: int = 20, timeout: int = 10) -> List[Dict[str, Any]]:
-    """调用东财公告接口，返回结构化列表。"""
+def fetch_announcements_em(code: str, limit: int = 20, timeout: int = 10) -> Dict[str, Any]:
+    """调用东财公告接口，返回结构化列表及错误信息。"""
+
     sec_code = _standardize_code(code)
     url = (
         "https://datacenter-web.eastmoney.com/api/data/v1/get?"
@@ -55,6 +60,12 @@ def fetch_announcements_em(code: str, limit: int = 20, timeout: int = 10) -> Lis
     payload = _request_json(url, timeout=timeout)
     items = payload.get("result", {}).get("data", []) if isinstance(payload, dict) else []
     out: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    if isinstance(payload, dict) and payload.get("_error"):
+        errors.append({"source": "announcement_eastmoney", "error_type": "exception", "message": str(payload.get("_error"))})
+    if not isinstance(items, list):
+        errors.append({"source": "announcement_eastmoney", "error_type": "invalid", "message": "unexpected payload"})
+        items = []
     for it in items:
         out.append(
             {
@@ -64,7 +75,9 @@ def fetch_announcements_em(code: str, limit: int = 20, timeout: int = 10) -> Lis
                 "type": it.get("NOTICE_TYPE") or it.get("COLUMN_CODE") or "公告",
             }
         )
-    return out
+    if not out and not errors:
+        errors.append({"source": "announcement_eastmoney", "error_type": "empty", "message": "no announcements"})
+    return {"items": out, "errors": errors}
 
 
 def fetch_announcements_tencent(code: str, limit: int = 15, timeout: int = 10) -> List[Dict[str, Any]]:

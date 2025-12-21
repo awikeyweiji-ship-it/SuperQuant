@@ -7,16 +7,31 @@ from typing import Any, Dict, List
 
 import requests
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Referer": "https://quote.eastmoney.com/",
+}
 
-def fetch_hot_topics_em(limit: int = 10, timeout: int = 10) -> List[Dict[str, Any]]:
+
+def fetch_hot_topics_em(limit: int = 10, timeout: int = 10, retries: int = 1) -> List[Dict[str, Any]]:
     """东财热门概念榜，返回主题及热度。"""
     url = (
         f"https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz={limit}&po=1&np=1"
         "&fltt=2&invt=2&fid=f62&fs=m:90+t:2&fields=f12,f14,f62,f113,f128,f136"
     )
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries + 1)):
+        try:
+            resp = requests.get(url, timeout=timeout, headers=HEADERS, proxies={"http": None, "https": None})
+            resp.raise_for_status()
+            payload = resp.json()
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(0.3 * (attempt + 1))
+            else:
+                raise
     items = payload.get("data", {}).get("diff", []) if isinstance(payload, dict) else []
     out: List[Dict[str, Any]] = []
     for it in items:

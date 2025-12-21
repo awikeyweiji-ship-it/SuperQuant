@@ -24,7 +24,7 @@ def fetch(symbol: str, limit: int = 15, **_: Any) -> Dict[str, Any]:
                     "time": ts,
                     "source": row.get("tag") or "hot_concept",
                     "url": url,
-                    "summary": row.get("reason") or "概念热度",
+                    "summary": row.get("reason") or row.get("title") or "概念热度",
                 }
             )
     except Exception as exc:  # noqa: BLE001
@@ -34,6 +34,7 @@ def fetch(symbol: str, limit: int = 15, **_: Any) -> Dict[str, Any]:
         "source": "news_hot_eastmoney",
         "retrieved_at": time.time(),
         "errors": errors,
+        "errors_count": len(errors),
         "filled_metrics": len(items),
         "fallback_used": False,
     }

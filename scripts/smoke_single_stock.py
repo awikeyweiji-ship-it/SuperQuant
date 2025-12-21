@@ -40,6 +40,14 @@ def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
     if "example.com" in serialized:
         failures.append("contains_example_stub")
 
+    diag_map = {d.get("module"): d for d in diag if isinstance(d, dict)}
+    for module in ["quote", "financial", "money_flow", "news_bundle"]:
+        info = diag_map.get(module, {})
+        filled = info.get("filled") or 0
+        err_cnt = info.get("errors_count") or 0
+        if filled == 0 or err_cnt > 0:
+            failures.append(f"{module}_unavailable")
+
     # news bundle basic schema
     nb = stock.get("news_bundle") or {}
     if isinstance(nb, dict):
@@ -50,6 +58,8 @@ def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
                 for req in ["title", "source"]:
                     if not first.get(req):
                         failures.append(f"news_{key}_missing_{req}")
+            else:
+                failures.append(f"news_{key}_empty")
     return {"diagnostics": diag, "failures": failures}
 
 

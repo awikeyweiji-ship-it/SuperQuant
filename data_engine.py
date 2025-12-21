@@ -196,6 +196,8 @@ class DataEngine:
 
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
+        if value is pd.NaT:
+            return None
         if isinstance(value, (_dt.date, _dt.datetime, pd.Timestamp)):
             try:
                 return value.isoformat()
@@ -206,6 +208,11 @@ class DataEngine:
                 return value.item()
             except Exception:
                 return value.tolist() if hasattr(value, "tolist") else str(value)
+        if isinstance(value, np.ndarray):
+            try:
+                return [DataEngine._json_safe(v) for v in value.tolist()]
+            except Exception:
+                return str(value)
         if isinstance(value, dict):
             return {k: DataEngine._json_safe(v) for k, v in value.items()}
         if isinstance(value, (list, tuple, set)):
@@ -376,10 +383,14 @@ class DataEngine:
             except Exception as exc:  # noqa: BLE001
                 meta_errors.append(build_error(key, "exception", str(exc)))
 
+        if sum(1 for v in data.values() if v) < 2:
+            meta_errors.append(build_error("news_bundle", "insufficient", "至少需要两类非空情报"))
+
         meta = {
             "source": "news_bundle_eastmoney",
             "retrieved_at": time.time(),
             "errors": meta_errors,
+            "errors_count": len(meta_errors),
             "fallback_used": False,
             "cache_hit": False,
             "filled_metrics": sum(len(v) for v in data.values()),
@@ -1798,10 +1809,14 @@ class DataEngine:
                 _add("$.financial.revenue_yoy", f"营收同比 {fin_data.get('revenue_yoy')}%", fin_data.get("revenue_yoy"))
             if fin_data.get("gross_margin") is not None:
                 _add("$.financial.gross_margin", f"毛利率 {fin_data.get('gross_margin')}%", fin_data.get("gross_margin"))
+            if not fin_data:
+                _add("$.financial", "财务数据缺失，建议观望")
             if money_data.get("main_net_inflow") is not None:
                 _add("$.money_flow.main_net_inflow", f"主力净流入 {money_data.get('main_net_inflow')}", money_data.get("main_net_inflow"))
             if money_data.get("super_large") is not None:
                 _add("$.money_flow.super_large", "超大单净流", money_data.get("super_large"))
+            if not money_data:
+                _add("$.money_flow", "资金流缺失，无法判断主力态度")
             if news_data.get("announcements"):
                 ann = news_data.get("announcements", [])[0]
                 _add("$.news_bundle.announcements[0]", ann.get("title", "公告"), url=ann.get("url", ""))
@@ -1811,6 +1826,8 @@ class DataEngine:
             if news_data.get("hot_events"):
                 hot = news_data.get("hot_events", [])[0]
                 _add("$.news_bundle.hot_events[0]", hot.get("title", "热点"), url=hot.get("url", ""))
+            if not any(news_data.get(k) for k in ["announcements", "reports", "hot_events"]):
+                _add("$.news_bundle", "新闻/公告缺失，需关注信息披露")
 
             while len(ev) < 5:
                 _add("$.diagnostics", "关键信息缺失，建议谨慎观望")
@@ -1843,7 +1860,8 @@ class DataEngine:
             elif score <= 0:
                 action = "回避" if score < 0 else "观望"
 
-            return {"evidence": ev, "action": action}
+            rationale = "规则决策：估值、盈利、资金、资讯综合打分" if ev else "缺数据默认观望"
+            return {"evidence": ev, "action": action, "rationale": rationale}
 
         advice_pack = _build_evidence_and_advice()
         evidence_pack = advice_pack.get("evidence", [])

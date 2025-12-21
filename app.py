@@ -22,7 +22,7 @@ from plotly.subplots import make_subplots
 
 # 引入核心组件
 from universe_cache import UniverseCache
-from data_engine import DataEngine, normalize_code
+from data_engine import DataEngine, normalize_code, standardize_code
 from market_scanner import MarketScanner, ScanConfig
 from deep_search_agent import DeepSearchAgent
 from radiation_engine import RadiationEngine

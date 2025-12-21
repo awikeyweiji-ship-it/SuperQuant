@@ -25,7 +25,7 @@ def _filter_items(items: List[Dict[str, Any]], meta_errors: List[Dict[str, str]]
                 "time": ts,
                 "source": row.get("type") or "eastmoney_announcement",
                 "url": url,
-                "summary": row.get("type") or title,
+                "summary": row.get("type") or title or "公告摘要",
             }
         )
     return cleaned
@@ -44,6 +44,7 @@ def fetch(symbol: str, limit: int = 20, **_: Any) -> Dict[str, Any]:
         "source": "news_announcements_eastmoney",
         "retrieved_at": time.time(),
         "errors": meta_errors,
+        "errors_count": len(meta_errors),
         "filled_metrics": len(items),
         "fallback_used": False,
     }

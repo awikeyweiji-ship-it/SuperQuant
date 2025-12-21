@@ -22,8 +22,8 @@ class ProviderRegistry:
 
     def register(self, domain: str, name: str, func: ProviderFunc, priority: int = 0) -> None:
         entries = self._providers.setdefault(domain, [])
-        entries.append(ProviderEntry(priority=-int(priority), name=name, func=func))
-        entries.sort()  # dataclass order uses priority first (negative for higher priority)
+        entries.append(ProviderEntry(priority=int(priority), name=name, func=func))
+        entries.sort(key=lambda e: e.priority, reverse=True)
 
     def get_providers(self, domain: str) -> List[ProviderEntry]:
         return list(self._providers.get(domain, []))
@@ -115,7 +115,11 @@ def run_providers_parallel(
         meta = payload.get("meta") or {}
         filled = meta.get("filled_metrics") or 0
         err_cnt = len(meta.get("errors") or [])
-        ts = meta.get("retrieved_at") or 0
+        ts_raw = meta.get("retrieved_at") or meta.get("ts") or 0
+        try:
+            ts = float(ts_raw)
+        except Exception:
+            ts = 0
         return (filled, -err_cnt, ts, entry.priority)
 
     best_entry, best_payload = sorted(results, key=_score, reverse=True)[0]

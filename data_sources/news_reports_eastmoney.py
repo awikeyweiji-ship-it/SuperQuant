@@ -24,7 +24,7 @@ def _collect_reports(fetcher, symbol: str, limit: int, errors: List[Dict[str, st
                     "time": ts,
                     "source": row.get("org") or "eastmoney_report",
                     "url": url,
-                    "summary": row.get("rating") or title,
+                    "summary": row.get("rating") or title or "研报摘要",
                 }
             )
     except Exception as exc:  # noqa: BLE001
@@ -41,6 +41,7 @@ def fetch(symbol: str, limit: int = 20, **_: Any) -> Dict[str, Any]:
         "source": "news_reports_eastmoney",
         "retrieved_at": time.time(),
         "errors": errors,
+        "errors_count": len(errors),
         "filled_metrics": len(items),
         "fallback_used": False,
     }

@@ -258,22 +258,46 @@ class DataEngine:
             data = (r.json() or {}).get("data") or {}
             if not data:
                 return {}
+            def _price(v: Any) -> Optional[float]:
+                if v in (None, "", "--"):
+                    return None
+                try:
+                    return float(v) / 100.0
+                except Exception:
+                    return None
+            def _pct(v: Any) -> Optional[float]:
+                if v in (None, "", "--"):
+                    return None
+                try:
+                    return float(v) / 100.0
+                except Exception:
+                    return None
+            def _to_num(v: Any) -> Optional[float]:
+                try:
+                    if v in (None, "", "--"):
+                        return None
+                    return float(v)
+                except Exception:
+                    return None
+            vol_raw = _to_num(data.get("f47"))  # 单位：手
+            amount_raw = _to_num(data.get("f48"))  # 单位：元
             return {
                 "code": normalize_code(code_std),
                 "name": data.get("f58", ""),
-                "price": data.get("f43"),
-                "open": data.get("f46"),
-                "high": data.get("f44"),
-                "low": data.get("f45"),
-                "preclose": data.get("f60"),
-                "pct_chg": data.get("f170"),
-                "vol": data.get("f47"),
-                "amount": data.get("f48"),
-                "turnover": data.get("f84"),
+                "price": _price(data.get("f43")),
+                "open": _price(data.get("f46")),
+                "high": _price(data.get("f44")),
+                "low": _price(data.get("f45")),
+                "preclose": _price(data.get("f60")),
+                "pct_chg": _pct(data.get("f170")),
+                "vol": vol_raw * 100 if vol_raw is not None else None,  # 转换为股
+                "amount": amount_raw,
+                "turnover": _pct(data.get("f84")),
                 "pe_ttm": data.get("f162"),
                 "pb": data.get("f167"),
-                "total_mv": data.get("f116"),
-                "float_mv": data.get("f117"),
+                "total_mv": _to_num(data.get("f116")),
+                "float_mv": _to_num(data.get("f117")),
+                "quote_date": data.get("f71"),
                 "source": "eastmoney_push2",
             }
         except Exception as e:
@@ -341,9 +365,9 @@ class DataEngine:
                 "name": "平安银行",
                 "price": 10.0,
                 "pct_chg": 0.0,
-                "vol": 1.0,
-                "amount": 1.0,
-                "turnover": 0.0,
+                "vol": 5.2e7,
+                "amount": 5.5e8,
+                "turnover": 0.9,
                 "high": 10.1,
                 "low": 9.9,
                 "open": 10.0,
@@ -356,19 +380,19 @@ class DataEngine:
             "601872.SH": {
                 "code": "601872.SH",
                 "name": "招商港口",
-                "price": 16.5,
-                "pct_chg": 0.2,
-                "vol": 1.0,
-                "amount": 1.0,
-                "turnover": 0.0,
-                "high": 16.8,
-                "low": 16.2,
-                "open": 16.4,
-                "preclose": 16.2,
+                "price": 8.52,
+                "pct_chg": -0.6,
+                "vol": 1.3e7,
+                "amount": 1.1e8,
+                "turnover": 0.4,
+                "high": 8.66,
+                "low": 8.43,
+                "open": 8.60,
+                "preclose": 8.57,
                 "pe_ttm": 12.0,
-                "pb": 1.5,
-                "total_mv": 1.5e11,
-                "float_mv": 1.2e11,
+                "pb": 1.2,
+                "total_mv": 8.9e10,
+                "float_mv": 6.5e10,
             },
         }
         return samples.get(code_std)
@@ -1125,6 +1149,20 @@ class DataEngine:
                 "revenue_yoy": 5.0,
                 "eps": 1.8,
             },
+            "601872.SH": {
+                "report_date": "2024-09-30",
+                "revenue": 170.2 * 1e8,
+                "net_profit": 22.4 * 1e8,
+                "gross_margin": 32.5,
+                "net_margin": 13.2,
+                "roe": 8.7,
+                "roa": 5.1,
+                "debt_ratio": 55.0,
+                "op_cashflow": 30.0 * 1e8,
+                "profit_yoy": 9.5,
+                "revenue_yoy": 7.8,
+                "eps": 0.86,
+            },
         }
         return samples.get(code_std)
 
@@ -1177,6 +1215,49 @@ class DataEngine:
     # -------------------------------------
     # 5.4 公告 / 研报 / 热点要事
     # -------------------------------------
+    def get_news_bundle_structured(self, code: str, limit: int = 8) -> FetchResult:
+        """聚合公告/研报/热点/论坛/观点，优先使用情报引擎统一 schema。"""
+
+        code_std = standardize_code(code)
+        if self.alt_engine and hasattr(self.alt_engine, "get_news_bundle_structured"):
+            try:
+                return self.alt_engine.get_news_bundle_structured(code_std)
+            except Exception as e:  # noqa: BLE001
+                err = build_error("alternative", "exception", str(e))
+                errors = [err]
+        else:
+            errors = [build_error("alternative", "missing", "情报引擎未初始化")]
+
+        # 保底：使用本地聚合，字段保持一致
+        bundle: Dict[str, Any] = {
+            "announcements": [],
+            "reports": [],
+            "hot_events": [],
+            "forums": [],
+            "opinions": [],
+        }
+        sources: Dict[str, str] = {}
+        fallback_used = True
+
+        ann = self.get_announcements_structured(code_std, limit=limit)
+        bundle["announcements"] = ann.data if isinstance(ann.data, list) else []
+        sources["announcements"] = ann.source
+        errors.extend(ann.errors)
+
+        rep = self.get_research_reports_structured(code_std, limit=limit)
+        bundle["reports"] = rep.data if isinstance(rep.data, list) else []
+        sources["reports"] = rep.source
+        errors.extend(rep.errors)
+
+        hot = self.get_hot_topics_structured(limit=limit)
+        bundle["hot_events"] = hot.data if isinstance(hot.data, list) else []
+        sources["hot_events"] = hot.source
+        errors.extend(hot.errors)
+
+        coverage = sum(1 for k in ["announcements", "reports", "hot_events"] if bundle.get(k))
+        meta = {"sources": sources, "filled_sections": coverage, "retrieved_at": _now_str()}
+        return make_result(bundle, source="news_bundle", errors=errors, fallback_used=fallback_used, meta=meta)
+
     def get_announcements_structured(self, code: str, limit: int = 12) -> FetchResult:
         code_std = standardize_code(code)
         errors: List[Dict[str, str]] = []

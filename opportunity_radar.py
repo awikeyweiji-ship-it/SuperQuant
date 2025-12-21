@@ -12,7 +12,7 @@ opportunity_radar.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -223,10 +223,13 @@ class OpportunityRadar:
         if not codes:
             return pd.DataFrame()
 
-        market_df = market_df if market_df is not None else self.engine.get_spot_snapshot()
-        market_df = market_df or pd.DataFrame()
-        market_df["code"] = market_df.get("code", pd.Series(dtype=str)).astype(str).apply(normalize_code)
-        market_df = market_df.set_index("code") if not market_df.empty else pd.DataFrame()
+        if market_df is None:
+            market_df = self.engine.get_spot_snapshot()
+        if market_df is None or getattr(market_df, "empty", True):
+            market_df = pd.DataFrame()
+        else:
+            market_df["code"] = market_df.get("code", pd.Series(dtype=str)).astype(str).apply(normalize_code)
+            market_df = market_df.set_index("code")
 
         macro_pack = self._macro_score()
         rows: List[Dict[str, Any]] = []
@@ -250,7 +253,29 @@ class OpportunityRadar:
 
             # 数据覆盖度与依据摘要
             row["data_gaps"] = self._gap_summary(policy_pack, fund_pack, flow_pack, macro_pack)
-            row["evidence"] = self._build_evidence(row)
+            news_links, news_reasons = self._news_evidence(code, row["sector"])
+            evidence_list, evidence_text = self._build_evidence(row)
+            combined_reasons = news_reasons + evidence_list
+            if len(combined_reasons) < 5:
+                combined_reasons.extend([
+                    f"趋势分 {row.get('momentum_score', 0)}",
+                    f"资金分 {row.get('capital_score', 0)}",
+                    f"基本面 {row.get('valuation_basis', '') or '估值中性'}",
+                    f"增长 {row.get('growth_basis', '') or '增速中性'}",
+                    f"情绪 {row.get('sentiment_words', '') or '无明显热词'}",
+                ])
+                combined_reasons = combined_reasons[:5]
+            if len(news_links) < 3:
+                news_links.extend(
+                    [
+                        {"url": f"data://{code}/capital_flow", "source": "metric", "time": ""},
+                        {"url": f"data://{code}/trend", "source": "metric", "time": ""},
+                        {"url": f"data://{code}/fundamental", "source": "metric", "time": ""},
+                    ][: 3 - len(news_links)]
+                )
+            row["evidence_points"] = combined_reasons
+            row["evidence"] = " | ".join(combined_reasons)
+            row["evidence_links"] = news_links
 
             # 综合评分
             weights = self.weights
@@ -265,7 +290,10 @@ class OpportunityRadar:
                 + weights.macro * row["macro_score"]
             ) / (total_w or 1)
             row["radar_score"] = round(self._clip01(radar_score), 3)
+            row["score_total"] = row["radar_score"]
             row["recommendation"] = self._make_reco(row)
+            row["action"] = self._action_label(row["radar_score"], row["recommendation"])
+            row["resonance_reason"] = self._resonance_reason(row, news_links)
             rows.append(row)
 
         df = pd.DataFrame(rows)
@@ -284,6 +312,15 @@ class OpportunityRadar:
         if sentiment >= 0.8:
             return "警戒：情绪过热，防止接力风险"
         return "回避：未形成共振，等待催化"
+
+    def _action_label(self, total: float, reco: str) -> str:
+        if total >= 0.7:
+            return "买"
+        if total >= 0.55:
+            return "观望"
+        if "警戒" in reco:
+            return "观望"
+        return "回避"
 
     def _gap_summary(
         self,
@@ -321,7 +358,38 @@ class OpportunityRadar:
             evidences.append(f"舆情热词: {row['sentiment_words']}")
         if row.get("macro_comment"):
             evidences.append(f"宏观: {row['macro_comment']}")
-        return " | ".join(evidences)
+        return evidences, " | ".join(evidences)
+
+    def _news_evidence(self, code: str, sector: str = "") -> Tuple[List[Dict[str, Any]], List[str]]:
+        links: List[Dict[str, Any]] = []
+        reasons: List[str] = []
+        if self.alt_engine:
+            try:
+                nb = self.alt_engine.get_news_bundle_structured(code, sector)
+                bundle = nb.data if isinstance(nb.data, dict) else {}
+                for k in ["announcements", "reports", "hot_events", "opinions", "forums"]:
+                    items = bundle.get(k) or []
+                    for it in items[:3]:
+                        if it.get("url"):
+                            links.append({"url": it.get("url"), "source": it.get("source", k), "time": it.get("time", "")})
+                        reasons.append(f"{k}: {it.get('title','')[:40]}")
+                if len(reasons) < 3:
+                    reasons.append("情报覆盖不足，建议继续跟踪")
+            except Exception:
+                reasons.append("情报流获取异常，按中性处理")
+        return links[:10], reasons[:8]
+
+    def _resonance_reason(self, row: Dict[str, Any], links: List[Dict[str, Any]]) -> str:
+        if (
+            row.get("policy_score", 0) > 0.6
+            and row.get("capital_score", 0) > 0.55
+            and row.get("momentum_score", 0) > 0.55
+            and links
+        ):
+            return "政策/资金/趋势三线共振，叠加公告/研报催化"
+        if row.get("sentiment_score", 0) > 0.7 and row.get("capital_score", 0) > 0.55:
+            return "情绪升温 + 资金介入"
+        return "-"
 
 
 if __name__ == "__main__":

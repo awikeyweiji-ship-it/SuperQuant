@@ -39,6 +39,7 @@ class FetchResult:
     meta: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        meta_dict: Dict[str, Any] = self.meta if isinstance(self.meta, dict) else {}
         return {
             "data": self.data,
             "ok": bool(self.ok),
@@ -48,7 +49,7 @@ class FetchResult:
             "ts": self.ts,
             "cache_hit": self.cache_hit,
             "cache_age": self.cache_age,
-            "meta": self.meta,
+            "meta": meta_dict,
         }
 
 

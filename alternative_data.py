@@ -95,6 +95,24 @@ class AlternativeDataEngine:
             "raw_excerpt": raw_excerpt or "",
         }
 
+    @staticmethod
+    def _news_item(
+        title: str,
+        url: str,
+        source: str,
+        time_str: str = "",
+        summary: str = "",
+        raw_excerpt: str | None = None,
+    ) -> Dict[str, Any]:
+        return {
+            "title": title or "",
+            "url": url or "",
+            "source": source or "",
+            "time": time_str or "",
+            "summary": summary or (title[:120] if title else ""),
+            "raw_excerpt": raw_excerpt or "",
+        }
+
     def _calculate_sentiment(self, text: str) -> float:
         if not text or not jieba: return 0.0
         words = list(jieba.cut(text))

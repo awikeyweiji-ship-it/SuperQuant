@@ -31,8 +31,13 @@ import numpy as np
 
 from logging_utils import get_data_logger, make_result, build_error, FetchResult
 from data_sources.provider_registry import ProviderRegistry, run_providers_parallel
-from data_sources.financial_eastmoney import fetch_financial_indicator_em
+from data_sources.quote_eastmoney import fetch as fetch_quote_eastmoney
+from data_sources.financial_eastmoney import fetch as fetch_financial_eastmoney
+from data_sources.moneyflow_eastmoney import fetch as fetch_moneyflow_eastmoney
 from data_sources.identity_eastmoney import fetch_identity_em
+from data_sources.news_announcements_eastmoney import fetch as fetch_news_announcements
+from data_sources.news_reports_eastmoney import fetch as fetch_news_reports
+from data_sources.news_hot_eastmoney import fetch as fetch_news_hot
 from data_sources.announcement_eastmoney import (
     fetch_announcements_em,
     fetch_announcements_tencent,
@@ -185,10 +190,83 @@ class DataEngine:
             return None
         return None
 
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        """Recursively convert values into JSON-serializable primitives."""
+
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, (_dt.date, _dt.datetime, pd.Timestamp)):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+        if isinstance(value, (np.generic,)):
+            try:
+                return value.item()
+            except Exception:
+                return value.tolist() if hasattr(value, "tolist") else str(value)
+        if isinstance(value, dict):
+            return {k: DataEngine._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [DataEngine._json_safe(v) for v in value]
+        try:
+            return float(value)
+        except Exception:
+            try:
+                return str(value)
+            except Exception:
+                return None
+
     def _register_default_providers(self) -> None:
-        self.provider_registry.register("financial", "legacy_financial", lambda code: self._provider_financial(code), priority=5)
-        self.provider_registry.register("money_flow", "legacy_money_flow", lambda code: self._provider_money_flow(code), priority=5)
-        self.provider_registry.register("news_bundle", "legacy_news_bundle", lambda code: self._provider_news_bundle(code), priority=5)
+        # Quote providers
+        self.provider_registry.register(
+            "quote",
+            "quote_eastmoney",
+            lambda code, **kwargs: self._provider_quote_module(code, fetch_quote_eastmoney),
+            priority=10,
+        )
+        self.provider_registry.register(
+            "quote",
+            "quote_tencent",
+            lambda code, **kwargs: self._provider_quote_from_func(code, self._fetch_quote_tencent, "tencent"),
+            priority=7,
+        )
+        self.provider_registry.register(
+            "quote",
+            "quote_akshare",
+            lambda code, **kwargs: self._provider_quote_from_func(code, self._fetch_quote_akshare, "akshare"),
+            priority=5,
+        )
+
+        # Financial & money flow providers
+        self.provider_registry.register(
+            "financial",
+            "financial_eastmoney",
+            lambda code, **kwargs: fetch_financial_eastmoney(code),
+            priority=10,
+        )
+        self.provider_registry.register(
+            "financial", "legacy_financial", lambda code, **kwargs: self._provider_financial(code), priority=5
+        )
+        self.provider_registry.register(
+            "money_flow",
+            "moneyflow_eastmoney",
+            lambda code, **kwargs: fetch_moneyflow_eastmoney(code),
+            priority=10,
+        )
+        self.provider_registry.register(
+            "money_flow", "legacy_money_flow", lambda code, **kwargs: self._provider_money_flow(code), priority=5
+        )
+
+        # News bundle
+        self.provider_registry.register(
+            "news_bundle",
+            "news_bundle_eastmoney",
+            lambda code, **kwargs: self._provider_news_bundle_eastmoney(code),
+            priority=10,
+        )
+        self.provider_registry.register("news_bundle", "legacy_news_bundle", lambda code, **kwargs: self._provider_news_bundle(code), priority=5)
 
     @staticmethod
     def _count_filled_fields(payload: Dict[str, Any]) -> int:
@@ -236,6 +314,37 @@ class DataEngine:
             meta["filled_metrics"] = meta.get("filled_metrics", self._count_filled_fields(data))
         return {"data": data, "meta": meta}
 
+    def _provider_quote_from_func(self, code: str, fetcher, source: str) -> Dict[str, Any]:
+        code_std = standardize_code(code)
+        data = self._standardize_quote(fetcher(code_std), code_std, source)
+        meta = {
+            "source": source,
+            "retrieved_at": time.time(),
+            "errors": [],
+            "fallback_used": False,
+            "cache_hit": False,
+            "ttl_sec": None,
+            "filled_metrics": self._count_filled_fields(data),
+        }
+        if not data:
+            meta["errors"].append(build_error(source, "empty", f"{source} 行情返回空"))
+        return {"data": data, "meta": meta}
+
+    def _provider_quote_module(self, code: str, provider_func) -> Dict[str, Any]:
+        payload = provider_func(code)
+        payload = payload or {}
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        meta.setdefault("source", "quote_eastmoney")
+        meta.setdefault("retrieved_at", time.time())
+        meta.setdefault("errors", [])
+        meta.setdefault("fallback_used", False)
+        meta.setdefault("cache_hit", False)
+        meta.setdefault("filled_metrics", self._count_filled_fields(data))
+        if not data:
+            meta["errors"].append(build_error(meta["source"], "empty", "行情数据为空"))
+        return {"data": data, "meta": meta}
+
     def _provider_financial(self, code: str) -> Dict[str, Any]:
         res = self.get_financial_features_structured(code)
         payload = self._fetchresult_to_provider_payload(res, "financial")
@@ -247,6 +356,35 @@ class DataEngine:
     def _provider_money_flow(self, code: str) -> Dict[str, Any]:
         res = self.get_money_flow_structured(code)
         return self._fetchresult_to_provider_payload(res, "money_flow")
+
+    def _provider_news_bundle_eastmoney(self, code: str) -> Dict[str, Any]:
+        code_std = standardize_code(code)
+        meta_errors: List[Dict[str, str]] = []
+        data = {"announcements": [], "reports": [], "hot_events": []}
+
+        for fetcher, key in [
+            (fetch_news_announcements, "announcements"),
+            (fetch_news_reports, "reports"),
+            (fetch_news_hot, "hot_events"),
+        ]:
+            try:
+                payload = fetcher(code_std)
+                section = payload.get("data", {}).get(key, []) if isinstance(payload, dict) else []
+                if section:
+                    data[key] = section
+                meta_errors.extend(payload.get("meta", {}).get("errors", []) if isinstance(payload, dict) else [])
+            except Exception as exc:  # noqa: BLE001
+                meta_errors.append(build_error(key, "exception", str(exc)))
+
+        meta = {
+            "source": "news_bundle_eastmoney",
+            "retrieved_at": time.time(),
+            "errors": meta_errors,
+            "fallback_used": False,
+            "cache_hit": False,
+            "filled_metrics": sum(len(v) for v in data.values()),
+        }
+        return {"data": data, "meta": meta}
 
     def _provider_news_bundle(self, code: str) -> Dict[str, Any]:
         res = self.get_news_bundle_structured(code)
@@ -658,45 +796,45 @@ class DataEngine:
         self.logger.error("spot snapshot unavailable after all providers")
         return pd.DataFrame()
 
-    def get_spot_row_structured(self, code: str) -> FetchResult:
+    def get_spot_row_structured(self, code: str, force_refresh: bool = False) -> FetchResult:
         code_std = standardize_code(code)
         cache_key = self.cache.key("quote_v1", {"code": code_std})
         errors: List[Dict[str, str]] = []
         cache_age = self._cache_age(cache_key)
 
-        cached = self.cache.get(cache_key, ttl=30)
-        if isinstance(cached, dict) and cached:
-            return make_result(cached, source=cached.get("source", "cache"), cache_hit=True, cache_age=cache_age)
+        if not force_refresh:
+            cached = self.cache.get(cache_key, ttl=30)
+            if isinstance(cached, dict) and cached:
+                return make_result(cached, source=cached.get("source", "cache"), cache_hit=True, cache_age=cache_age)
 
-        providers = [
-            ("eastmoney", lambda: self._fetch_quote_eastmoney(code_std)),
-            ("tencent", lambda: self._fetch_quote_tencent(code_std)),
-        ]
+        payload, _ = run_providers_parallel(
+            self.provider_registry.get_providers("quote"),
+            code_std,
+            timeout=8.0,
+            retries=1,
+            force_refresh=force_refresh,
+        )
 
-        if ak is not None:
-            providers.append(("akshare", lambda: self._fetch_quote_akshare(code_std)))
-        else:
-            errors.append(build_error("akshare", "skip", "AkShare 未安装/不可用，跳过行情源"))
+        if payload:
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+            if data:
+                self.cache.set(cache_key, data)
+            return make_result(
+                data,
+                source=meta.get("source", "quote"),
+                fallback_used=meta.get("fallback_used", False),
+                errors=meta.get("errors", []),
+                cache_hit=False,
+                cache_age=None,
+                meta=meta,
+            )
 
-        for idx, (name, fn) in enumerate(providers):
-            try:
-                raw = _retry(fn, max_retries=3)
-                std = self._standardize_quote(raw, code_std, name)
-                if std:
-                    self.cache.set(cache_key, std)
-                    fallback_used = idx > 0
-                    return make_result(std, source=name, fallback_used=fallback_used, errors=errors, cache_hit=False, cache_age=None)
-                if name == "akshare" and ak is None:
-                    errors.append(build_error(name, "skip", "AkShare 未安装，未尝试"))
-                else:
-                    errors.append(build_error(name, "empty", f"{name} 行情返回空"))
-            except Exception as e:
-                errors.append(build_error(name, "exception", str(e)))
-
-        stale = self.cache.get(cache_key, ttl=None)
-        if isinstance(stale, dict) and stale:
-            errors.append(build_error("quote", "stale_cache", "使用历史缓存，数据可能过期"))
-            return make_result(stale, source=stale.get("source", "cache_stale"), fallback_used=True, errors=errors, cache_hit=True, cache_age=cache_age)
+        if not force_refresh:
+            stale = self.cache.get(cache_key, ttl=None)
+            if isinstance(stale, dict) and stale:
+                errors.append(build_error("quote", "stale_cache", "使用历史缓存，数据可能过期"))
+                return make_result(stale, source=stale.get("source", "cache_stale"), fallback_used=True, errors=errors, cache_hit=True, cache_age=cache_age)
 
         sample = self._quote_sample(code_std)
         if sample:
@@ -1202,10 +1340,10 @@ class DataEngine:
 
     def _fetch_financial_from_eastmoney(self, code_std: str, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
         try:
-            df = fetch_financial_indicator_em(code_std)
-            if df is not None and not df.empty:
-                row = df.iloc[0].to_dict()
-                return self._map_financial_row(row)
+            payload = fetch_financial_eastmoney(code_std)
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            if data:
+                return data
             errors.append(build_error("eastmoney", "empty", "东财财务指标为空"))
         except Exception as e:
             errors.append(build_error("eastmoney", "exception", str(e)))
@@ -1570,7 +1708,6 @@ class DataEngine:
                 basic_meta[label] = meta
                 return {}
 
-        quote = _safe_fetch(lambda: self.get_spot_row_structured(code_std, force_refresh=force_refresh), "quote")
         identity = _safe_fetch(lambda: self.get_stock_identity_structured(code_std), "identity")
         kline_res = self.get_kline_structured(code_std, limit=120)
         kline_meta = {
@@ -1597,40 +1734,119 @@ class DataEngine:
 
         # 并行 provider 域
         provider_trace: Dict[str, Any] = {}
-        def _run(domain: str):
+        def _run(domain: str, **kwargs: Any):
             payload, traces = run_providers_parallel(
                 self.provider_registry.get_providers(domain),
                 code_std,
                 timeout=8.0,
+                retries=1,
+                **kwargs,
             )
             provider_trace[domain] = traces
-            return payload or {"data": {}, "meta": {"source": "unavailable", "errors": [build_error(domain, "empty", "无有效数据")], "filled_metrics": 0}}
+            if payload:
+                meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+                meta.setdefault("filled_metrics", self._count_filled_fields(payload.get("data", {})))
+                payload["meta"] = meta
+                return payload
+            return {
+                "data": {},
+                "meta": {"source": "unavailable", "errors": [build_error(domain, "empty", "无有效数据")], "filled_metrics": 0},
+            }
 
-        financial_payload = _run("financial")
-        money_payload = _run("money_flow")
-        news_payload = _run("news_bundle")
+        def _clean(payload: Dict[str, Any]) -> Dict[str, Any]:
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+            if isinstance(data, dict):
+                data, blocked = self._sanitize_stub_data(data)
+                if blocked:
+                    meta.setdefault("errors", []).extend(blocked)
+                    meta["fallback_used"] = True
+            payload["data"] = data
+            payload["meta"] = meta
+            return payload
 
-        # 汇总与 evidence
-        def _build_evidence() -> List[Dict[str, Any]]:
+        quote_payload = _clean(_run("quote", force_refresh=force_refresh))
+        financial_payload = _clean(_run("financial"))
+        money_payload = _clean(_run("money_flow"))
+        news_payload = _clean(_run("news_bundle"))
+
+        quote = quote_payload.get("data", {}) if isinstance(quote_payload, dict) else {}
+        basic_meta["quote"] = quote_payload.get("meta", {}) if isinstance(quote_payload, dict) else {}
+
+        # 汇总与 evidence + advice
+        def _build_evidence_and_advice() -> Dict[str, Any]:
             ev: List[Dict[str, Any]] = []
-            if quote.get("price"):
-                ev.append({"path": "quote.price", "value": quote.get("price"), "source": basic_meta.get("quote", {}).get("source")})
-            if identity.get("name"):
-                ev.append({"path": "identity.name", "value": identity.get("name"), "source": basic_meta.get("identity", {}).get("source")})
             fin_data = financial_payload.get("data", {}) if isinstance(financial_payload, dict) else {}
-            for key in ["pe_ttm", "pb", "roe"]:
-                if fin_data.get(key) is not None:
-                    ev.append({"path": f"financial.{key}", "value": fin_data.get(key), "source": financial_payload.get("meta", {}).get("source")})
             money_data = money_payload.get("data", {}) if isinstance(money_payload, dict) else {}
-            if money_data.get("main_net_inflow") is not None:
-                ev.append({"path": "money_flow.main_net_inflow", "value": money_data.get("main_net_inflow"), "source": money_payload.get("meta", {}).get("source")})
             news_data = news_payload.get("data", {}) if isinstance(news_payload, dict) else {}
-            if news_data.get("announcements"):
-                first = news_data["announcements"][0]
-                ev.append({"path": "news_bundle.announcements[0].title", "value": first.get("title"), "source": news_payload.get("meta", {}).get("source")})
-            return ev[:8]
 
-        evidence_pack = _build_evidence()
+            def _add(ref: str, summary: str, value: Any = None, url: str = ""):
+                entry = {"ref": ref, "summary": summary}
+                if value is not None:
+                    entry["value"] = value
+                if url:
+                    entry["url"] = url
+                ev.append(entry)
+
+            if quote.get("price") is not None:
+                _add("$.quote.price", f"现价 {quote.get('price')}", quote.get("price"))
+            if fin_data.get("pe_ttm") is not None:
+                _add("$.financial.pe_ttm", f"市盈率TTM {fin_data.get('pe_ttm')}", fin_data.get("pe_ttm"))
+            if fin_data.get("roe") is not None:
+                _add("$.financial.roe", f"ROE {fin_data.get('roe')}%", fin_data.get("roe"))
+            if fin_data.get("revenue_yoy") is not None:
+                _add("$.financial.revenue_yoy", f"营收同比 {fin_data.get('revenue_yoy')}%", fin_data.get("revenue_yoy"))
+            if fin_data.get("gross_margin") is not None:
+                _add("$.financial.gross_margin", f"毛利率 {fin_data.get('gross_margin')}%", fin_data.get("gross_margin"))
+            if money_data.get("main_net_inflow") is not None:
+                _add("$.money_flow.main_net_inflow", f"主力净流入 {money_data.get('main_net_inflow')}", money_data.get("main_net_inflow"))
+            if money_data.get("super_large") is not None:
+                _add("$.money_flow.super_large", "超大单净流", money_data.get("super_large"))
+            if news_data.get("announcements"):
+                ann = news_data.get("announcements", [])[0]
+                _add("$.news_bundle.announcements[0]", ann.get("title", "公告"), url=ann.get("url", ""))
+            if news_data.get("reports"):
+                rep = news_data.get("reports", [])[0]
+                _add("$.news_bundle.reports[0]", rep.get("title", "研报"), url=rep.get("url", ""))
+            if news_data.get("hot_events"):
+                hot = news_data.get("hot_events", [])[0]
+                _add("$.news_bundle.hot_events[0]", hot.get("title", "热点"), url=hot.get("url", ""))
+
+            while len(ev) < 5:
+                _add("$.diagnostics", "关键信息缺失，建议谨慎观望")
+
+            score = 0
+            pe = fin_data.get("pe_ttm")
+            roe = fin_data.get("roe")
+            rev = fin_data.get("revenue_yoy")
+            money = money_data.get("main_net_inflow")
+            if pe is not None:
+                if pe < 25:
+                    score += 1
+                elif pe > 60:
+                    score -= 1
+            if roe is not None and roe > 12:
+                score += 1
+            if rev is not None and rev > 5:
+                score += 1
+            if money is not None:
+                if money > 0:
+                    score += 1
+                else:
+                    score -= 1
+            if news_data.get("announcements") and news_data.get("reports"):
+                score += 1
+
+            action = "观望"
+            if score >= 3:
+                action = "买"
+            elif score <= 0:
+                action = "回避" if score < 0 else "观望"
+
+            return {"evidence": ev, "action": action}
+
+        advice_pack = _build_evidence_and_advice()
+        evidence_pack = advice_pack.get("evidence", [])
 
         meta_map = {
             "quote": basic_meta.get("quote", {}),
@@ -1662,7 +1878,7 @@ class DataEngine:
                 "errors_count": len(mm.get("errors") or []),
             })
 
-        return {
+        result = {
             "code": code_std,
             "quote": quote,
             "identity": identity,
@@ -1672,9 +1888,12 @@ class DataEngine:
             "news_bundle": news_payload.get("data", {}),
             "diagnostics": diagnostics,
             "evidence_pack": evidence_pack,
+            "advice": advice_pack,
             "provider_trace": provider_trace,
             "_meta": meta_map,
         }
+
+        return DataEngine._json_safe(result)
 
     def get_holistic_data(self, code: str) -> Dict[str, Any]:
         code = normalize_code(code)

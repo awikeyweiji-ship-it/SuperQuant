@@ -32,7 +32,7 @@ def validate(stock: Dict[str, Any]) -> List[str]:
             failures.append(f"financial_missing_{key}")
             break
 
-    serialized = json.dumps(stock, ensure_ascii=False)
+    serialized = json.dumps(stock, ensure_ascii=False, default=str)
     if "example.com" in serialized:
         failures.append("example_stub_detected")
     return failures

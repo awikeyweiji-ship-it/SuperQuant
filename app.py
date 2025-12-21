@@ -199,7 +199,7 @@ def _safe_fetch(fn, label: str) -> FetchResult:
 
 
 def _safe_holistic(engine, code: str):
-    code_std = normalize_code(code)
+    code_std = standardize_code(code)
     try:
         res = engine.single_stock(
             code_std,
@@ -223,6 +223,7 @@ def _safe_holistic(engine, code: str):
             "news_bundle": {},
             "diagnostics": [],
             "evidence_pack": [],
+            "advice": {"action": "观望", "evidence": []},
             "_meta": {"error": str(e)},
         }
 
@@ -591,7 +592,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         md = _as_dict(dp.get('market_data'))
         c_h1.metric("现价", _fmt_val(md.get('close') or md.get('price')), _fmt_val(md.get('pct') or md.get('pct_chg'), suffix="%"))
         c_h2.metric("AI 综合评分", _fmt_val(rep.get('ai_score')))
-        
+
         # 决策高亮
         decision = rep.get('decision', '观望')
         color_cls = "decision-buy" if "买" in decision or "潜伏" in decision else "decision-sell" if "卖" in decision or "清" in decision else ""
@@ -599,6 +600,21 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         mc_val = md.get('market_cap')
         mc_display = _fmt_val(mc_val, suffix="亿") if mc_val not in (None, "", 0) else "—"
         c_h4.metric("市值", mc_display)
+
+        advice = _as_dict(dp.get("advice"))
+        if advice:
+            st.info(f"规则建议：{advice.get('action', '观望')}")
+            ev_list = advice.get("evidence") or []
+            if isinstance(ev_list, list):
+                for ev in ev_list:
+                    ref = _as_dict(ev).get("ref") or ""
+                    summary = _as_dict(ev).get("summary") or ""
+                    url = _as_dict(ev).get("url") or ""
+                    prefix = f"[{ref}] " if ref else ""
+                    if url:
+                        st.markdown(f"- {prefix}[{summary}]({url})")
+                    else:
+                        st.markdown(f"- {prefix}{summary}")
 
         with st.expander("🩺 数据链路诊断"):
             diag_rows = []

@@ -1,4 +1,7 @@
-"""Single stock smoke test driven by the new provider fan-out pipeline."""
+"""Single stock smoke test driven by the new provider fan-out pipeline.
+
+验收示例：python -m compileall app.py data_engine.py logging_utils.py alternative_data.py data_sources scripts
+"""
 from __future__ import annotations
 
 import json

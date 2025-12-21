@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-ProviderFunc = Callable[[str], Dict[str, Any]]
+ProviderFunc = Callable[..., Dict[str, Any]]
 
 
 @dataclass(order=True)
@@ -33,6 +33,8 @@ def run_providers_parallel(
     providers: List[ProviderEntry],
     symbol: str,
     timeout: float = 8.0,
+    retries: int = 0,
+    **kwargs: Any,
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Execute providers in parallel and pick the best result.
 
@@ -45,14 +47,30 @@ def run_providers_parallel(
     traces: List[Dict[str, Any]] = []
     results: List[Tuple[ProviderEntry, Dict[str, Any]]] = []
 
+    def _invoke(entry: ProviderEntry):
+        last_exc: Optional[BaseException] = None
+        start = time.time()
+        for attempt in range(max(1, retries + 1)):
+            try:
+                payload = entry.func(symbol, **kwargs)
+                return payload, time.time() - start
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < retries:
+                    time.sleep(0.2 * (attempt + 1))
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("provider invocation failed")
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as executor:
-        future_map = {executor.submit(p.func, symbol): p for p in providers}
+        future_map = {executor.submit(_invoke, p): p for p in providers}
+        start_wait = time.time()
         try:
             for future in concurrent.futures.as_completed(future_map, timeout=timeout):
                 entry = future_map[future]
-                start = time.time()
                 try:
-                    payload = future.result(timeout=max(0.1, timeout - (time.time() - start)))
+                    remaining = max(0.1, timeout - (time.time() - start_wait))
+                    payload, elapsed = future.result(timeout=remaining)
                     payload = payload or {}
                     meta = payload.get("meta") or {}
                     meta.setdefault("source", entry.name)
@@ -63,7 +81,7 @@ def run_providers_parallel(
                         {
                             "provider": entry.name,
                             "success": True,
-                            "elapsed": meta.get("elapsed") or meta.get("duration") or (time.time() - meta.get("retrieved_at", time.time())),
+                            "elapsed": meta.get("elapsed") or meta.get("duration") or elapsed,
                             "errors": meta.get("errors", []),
                             "filled_metrics": meta.get("filled_metrics", 0),
                         }

@@ -148,6 +148,19 @@ def _fmt_ts(ts_val: float) -> str:
         return "-"
 
 
+def _fmt_val(val, suffix: str = ""):
+    if val is None:
+        return "—"
+    try:
+        if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+            return "—"
+    except Exception:
+        pass
+    if val == "" or val == "--":
+        return "—"
+    return f"{val}{suffix}" if suffix else str(val)
+
+
 def _render_errors(errors):
     if not errors:
         st.caption("无错误")
@@ -185,6 +198,8 @@ def _safe_holistic(engine, code: str):
     else:
         alt = make_result({}, source="alternative", fallback_used=True, errors=[build_error("alternative", "missing", "另类数据引擎未初始化")])
 
+    news_bundle = _safe_fetch(lambda: engine.get_news_bundle_structured(code_std), "news_bundle")
+
     tech_brief = "无数据"
     if hasattr(kline.data, "empty") and not kline.data.empty:
         try:
@@ -205,6 +220,7 @@ def _safe_holistic(engine, code: str):
         "macro_context": alt.data.get("macro_environment", {}) if isinstance(alt.data, dict) else {},
         "corporate_news": alt.data.get("corporate_news", []) if isinstance(alt.data, dict) else [],
         "macro_news": alt.data.get("macro_news", []) if isinstance(alt.data, dict) else [],
+        "news_bundle": news_bundle.data,
         "kline": kline.data,
     }
 
@@ -215,6 +231,7 @@ def _safe_holistic(engine, code: str):
         "financial": fin.to_dict(),
         "money_flow": money.to_dict(),
         "alternative": alt.to_dict(),
+        "news_bundle": news_bundle.to_dict(),
     }
     return pack
 
@@ -224,7 +241,10 @@ def _render_meta(meta: dict):
     fb = "是" if meta.get("fallback_used") else "否"
     cache = "命中" if meta.get("cache_hit") else "未命中"
     ts_str = _fmt_ts(meta.get("ts"))
-    st.caption(f"来源: {src} | fallback: {fb} | 缓存: {cache} | 时间: {ts_str}")
+    filled = None
+    if isinstance(meta.get("meta"), dict):
+        filled = meta.get("meta", {}).get("filled_metrics") or meta.get("meta", {}).get("count")
+    st.caption(f"来源: {src} | fallback: {fb} | 缓存: {cache} | 时间: {ts_str} | 覆盖: {filled if filled is not None else '—'}")
 
 
 def _minmax_norm(s: pd.Series) -> pd.Series:
@@ -540,6 +560,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
     if 'report' in st.session_state:
         rep = st.session_state['report']
         dp = st.session_state['dp']
+        news_bundle = dp.get("news_bundle") if isinstance(dp, dict) else {}
         meta_map = dp.get("_meta", {}) if isinstance(dp, dict) else {}
         quote_meta = meta_map.get("quote", {})
         identity_meta = meta_map.get("identity", {})
@@ -547,6 +568,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         fin_meta = meta_map.get("financial", {})
         money_meta = meta_map.get("money_flow", {})
         alt_meta = meta_map.get("alternative", {})
+        news_meta = meta_map.get("news_bundle", {})
 
         # 1. 核心决策头 (Header)
         st.markdown("---")
@@ -556,15 +578,15 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
 
         c_h1, c_h2, c_h3, c_h4 = st.columns(4)
         md = dp.get('market_data') or {}
-        c_h1.metric("现价", md.get('close') or md.get('price'), f"{md.get('pct') or md.get('pct_chg')}%")
-        c_h2.metric("AI 综合评分", rep.get('ai_score'))
+        c_h1.metric("现价", _fmt_val(md.get('close') or md.get('price')), _fmt_val(md.get('pct') or md.get('pct_chg'), suffix="%"))
+        c_h2.metric("AI 综合评分", _fmt_val(rep.get('ai_score')))
         
         # 决策高亮
         decision = rep.get('decision', '观望')
         color_cls = "decision-buy" if "买" in decision or "潜伏" in decision else "decision-sell" if "卖" in decision or "清" in decision else ""
         c_h3.markdown(f"**决策: <span class='{color_cls}'>{decision}</span>**", unsafe_allow_html=True)
         mc_val = md.get('market_cap')
-        mc_display = "-" if mc_val in (None, "", 0) else f"{mc_val}亿"
+        mc_display = _fmt_val(mc_val, suffix="亿") if mc_val not in (None, "", 0) else "—"
         c_h4.metric("市值", mc_display)
 
         with st.expander("🩺 数据链路诊断"):
@@ -576,7 +598,9 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 ("financial", "财务", fin_meta),
                 ("money_flow", "资金", money_meta),
                 ("alternative", "情报", alt_meta),
+                ("news_bundle", "情报流", news_meta),
             ]:
+                meta_meta = meta.get("meta", {}) if isinstance(meta, dict) else {}
                 diag_rows.append({
                     "模块": label,
                     "ok": meta.get("ok"),
@@ -584,11 +608,12 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                     "fallback": meta.get("fallback_used"),
                     "cache_hit": meta.get("cache_hit"),
                     "ts": _fmt_ts(meta.get("ts")),
+                    "filled": meta_meta.get("filled_metrics") or meta_meta.get("count"),
                     "errors": len(meta.get("errors", [])),
                 })
             if diag_rows:
                 st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
-            for label, meta in [("行情", quote_meta), ("身份", identity_meta), ("K线", kline_meta), ("财务", fin_meta), ("资金", money_meta), ("情报", alt_meta)]:
+            for label, meta in [("行情", quote_meta), ("身份", identity_meta), ("K线", kline_meta), ("财务", fin_meta), ("资金", money_meta), ("情报", alt_meta), ("情报流", news_meta)]:
                 if meta.get("errors"):
                     st.markdown(f"**{label}错误详情:**")
                     _render_errors(meta.get("errors"))
@@ -674,35 +699,49 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
 
                 st.markdown("#### 🗣️ 舆情与情绪 (Sentiment)")
                 sent = dp['alternative_intelligence']
-                st.write(f"散户情绪分: {sent.get('retail_sentiment')}")
+                st.write(f"散户情绪分: {_fmt_val(sent.get('retail_sentiment'))}")
                 st.text(f"股吧样本: {sent.get('raw_guba_sample')}")
                 _render_meta(alt_meta)
                 if not alt_meta.get("ok"):
                     _render_errors(alt_meta.get("errors"))
 
             st.divider()
-            st.markdown("#### 原始情报参考")
-            with st.expander("点击查看 AI 引用的新闻流"):
-                st.json(dp.get('corporate_news'))
-                st.json(dp.get('macro_news'))
+            st.markdown("#### 📡 情报流 (公告 / 研报 / 热点 / 论坛)")
+            nb = news_bundle if isinstance(news_bundle, dict) else {}
+            for key, label in [
+                ("announcements", "公告"),
+                ("reports", "研报"),
+                ("hot_events", "热点"),
+                ("forums", "股吧"),
+                ("opinions", "观点"),
+            ]:
+                items = nb.get(key) or []
+                if not items:
+                    continue
+                st.markdown(f"**{label} ({len(items)})**")
+                df_show = pd.DataFrame(items)[[c for c in ["title", "time", "source", "url", "summary"] if c in pd.DataFrame(items).columns]].head(5)
+                st.dataframe(df_show, use_container_width=True)
+            _render_meta(news_meta)
+            if not news_meta.get("ok"):
+                _render_errors(news_meta.get("errors"))
 
         # --- Tab 4: 财务与资金 (Fundamentals) ---
         with tab_fund:
             fin = dp.get('financials') or {}
             c_f1, c_f2, c_f3, c_f4 = st.columns(4)
-            c_f1.metric("ROE", f"{fin.get('roe')}%")
-            c_f2.metric("毛利率", f"{fin.get('gross_margin')}%")
-            c_f3.metric("利润增长", f"{fin.get('profit_yoy')}%")
-            c_f4.metric("营收增长", f"{fin.get('revenue_yoy')}%")
-            st.write(f"报告期: {fin.get('report_date')}")
+            c_f1.metric("ROE", _fmt_val(fin.get('roe'), suffix="%"))
+            c_f2.metric("毛利率", _fmt_val(fin.get('gross_margin'), suffix="%"))
+            c_f3.metric("利润增长", _fmt_val(fin.get('profit_yoy'), suffix="%"))
+            c_f4.metric("营收增长", _fmt_val(fin.get('revenue_yoy'), suffix="%"))
+            st.write(f"报告期: {_fmt_val(fin.get('report_date'))}")
             _render_meta(fin_meta)
             if not fin_meta.get("ok"):
                 _render_errors(fin_meta.get("errors"))
 
             st.markdown("---")
             money = dp.get('money_flow') or {}
-            st.metric("今日主力净流入", f"{money.get('main_net_inflow_today')} 万")
-            st.write(f"北向: {money.get('north_money_net')} | 两融: {money.get('margin_balance_delta')}")
+            st.metric("今日主力净流入", _fmt_val(money.get('main_net_inflow_today'), suffix=" 万"))
+            st.write(f"北向: {_fmt_val(money.get('north_money_net'))} | 两融: {_fmt_val(money.get('margin_balance_delta'))}")
             _render_meta(money_meta)
             if not money_meta.get("ok"):
                 _render_errors(money_meta.get("errors"))

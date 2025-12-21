@@ -71,6 +71,30 @@ def _pd_error_message() -> Optional[str]:
     return _PD_ERROR
 
 
+def _safe_dataframe(df, **kwargs):
+    """Render dataframe defensively to avoid Arrow conversion crashes."""
+    try:
+        return st.dataframe(df, **kwargs)
+    except Exception:
+        pd = _get_pandas()
+        if pd is None:
+            try:
+                return st.dataframe(df, **kwargs)
+            except Exception:
+                return st.dataframe([], **kwargs)
+        try:
+            safe_df = df.copy()
+            for col in safe_df.columns:
+                if str(safe_df[col].dtype) == "object":
+                    safe_df[col] = safe_df[col].astype(str)
+            return st.dataframe(safe_df, **kwargs)
+        except Exception:
+            try:
+                return st.dataframe(pd.DataFrame(df).astype(str), **kwargs)
+            except Exception:
+                return st.dataframe([], **kwargs)
+
+
 # ==========================================
 # 1. 页面全局配置
 # ==========================================
@@ -114,15 +138,15 @@ with st.sidebar.expander("🔑 神经连接 (API Keys)", expanded=True):
     tavily_key = st.text_input("Tavily Key (可选)", value=(cfg.tavily_api_key or ""), type="password", help="用于联网搜索（不填也可离线运行）")
 
     c1, c2, c3 = st.columns(3)
-    if c1.button("💾 保存配置", use_container_width=True):
+    if c1.button("💾 保存配置", width="stretch"):
         update_keys(deepseek_api_key=ds_key, tavily_api_key=tavily_key)
         st.success("已保存到本地配置（.w5brain_config.json）。定时指挥塔也会读取同一份配置。")
 
-    if c2.button("🔌 测试DeepSeek", use_container_width=True):
+    if c2.button("🔌 测试DeepSeek", width="stretch"):
         ok, msg = test_deepseek(ds_key)
         (st.success if ok else st.error)(msg)
 
-    if c3.button("🔌 测试Tavily", use_container_width=True):
+    if c3.button("🔌 测试Tavily", width="stretch"):
         ok, msg = test_tavily(tavily_key)
         (st.success if ok else st.warning)(msg)
 
@@ -425,7 +449,7 @@ def plot_kline(code, freq='daily', title="K线图"):
         template="plotly_white",
         title=dict(text=title, font=dict(size=14))
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 def plot_radar(scores: dict):
     """绘制因子评分雷达图"""
@@ -450,7 +474,7 @@ def plot_radar(scores: dict):
         showlegend=False, height=300, 
         margin=dict(t=20, b=20, l=40, r=40)
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 # ==========================================
 # 4. 主功能逻辑
@@ -574,7 +598,7 @@ if mode == "☢️ 天网机会雷达 (Smart Radar)":
             disp = df_res[cols].head(top_n).copy() if cols else df_res.head(top_n).copy()
             if cols:
                 disp.columns = labels
-            st.dataframe(disp, use_container_width=True)
+            _safe_dataframe(disp, width="stretch")
 
             
             # 深度审计入口
@@ -682,7 +706,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             if diag_rows:
                 pd = _get_pandas()
                 if pd is not None:
-                    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+                    _safe_dataframe(pd.DataFrame(diag_rows), width="stretch")
                 else:
                     st.table(diag_rows)
             for label, meta in [
@@ -808,7 +832,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 if pd is not None:
                     df_temp = pd.DataFrame(items)
                     cols = [c for c in ["title", "time", "source", "url", "summary"] if c in df_temp.columns]
-                    st.dataframe(df_temp[cols].head(5), use_container_width=True)
+                    _safe_dataframe(df_temp[cols].head(5), width="stretch")
                 else:
                     st.table(items[:5])
             _render_meta(news_meta)
@@ -915,19 +939,19 @@ elif mode == "📦 模拟仓 (Paper Portfolio)":
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=curve["date"], y=curve["equity"], mode="lines", name="Equity"))
                 fig.update_layout(height=360, margin=dict(l=10,r=10,t=30,b=10), xaxis_title="Date", yaxis_title="Equity")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
             trades = res.get("trades")
             if trades is not None and not getattr(trades, "empty", True):
                 st.subheader("交易记录")
-                st.dataframe(trades, use_container_width=True, height=320)
+                _safe_dataframe(trades, width="stretch", height=320)
 
             pos = res.get("positions")
             if pos is not None and len(pos):
                 st.subheader("期末持仓")
                 pd = _get_pandas()
                 if pd is not None:
-                    st.dataframe(pd.DataFrame(pos).sort_values("weight", ascending=False), use_container_width=True, height=260)
+                    _safe_dataframe(pd.DataFrame(pos).sort_values("weight", ascending=False), width="stretch", height=260)
                 else:
                     st.table(pos)
 
@@ -971,7 +995,7 @@ elif mode == "📊 策略回测 (Time Machine)":
                 history = runner.history
                 if pd is not None:
                     df_res = pd.DataFrame(history)
-                    st.dataframe(df_res, use_container_width=True)
+                    _safe_dataframe(df_res, width="stretch")
                     if 'date' in df_res.columns and 'total' in df_res.columns:
                         st.line_chart(df_res.set_index('date')['total'])
                 else:
@@ -1055,7 +1079,7 @@ elif mode == "📊 策略回测 (Time Machine)":
                     curve = out.get('curve')
                     pd = _get_pandas()
                     if pd is not None and isinstance(curve, pd.DataFrame) and not curve.empty:
-                        st.dataframe(curve, use_container_width=True)
+                        _safe_dataframe(curve, width="stretch")
                         if 'date' in curve.columns and 'equity' in curve.columns:
                             st.line_chart(curve.set_index('date')['equity'])
                     elif curve:

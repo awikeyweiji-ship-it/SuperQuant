@@ -17,3 +17,8 @@ venv/
 
 # Secrets
 .env
+
+# Local cache & temp artifacts
+.superquant_cache/
+deep_audit.py
+*.local.cache

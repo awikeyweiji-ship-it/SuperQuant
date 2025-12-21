@@ -440,7 +440,7 @@ class DataEngine:
             px = self._market_prefix(code)
             q = f's_{px}{code}'
             url = f'https://qt.gtimg.cn/q={q}'
-            r = requests.get(url, timeout=8, proxies={"http": None, "https": None})
+            r = requests.get(url, timeout=8)
             txt = (r.text or '').strip()
             if '~' not in txt:
                 return {}
@@ -499,7 +499,7 @@ class DataEngine:
             "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f170,f71,f84,f162,f167,f116,f117",
         }
         try:
-            r = requests.get(url, params=params, timeout=10, proxies={"http": None, "https": None})
+            r = requests.get(url, params=params, timeout=10)
             data = (r.json() or {}).get("data") or {}
             if not data:
                 return {}
@@ -717,7 +717,7 @@ class DataEngine:
             "Accept": "application/json,text/plain,*/*",
             "Referer": "https://quote.eastmoney.com/",
         }
-        r = requests.get(url, params=params, headers=headers, timeout=12, proxies={"http": None, "https": None})
+        r = requests.get(url, params=params, headers=headers, timeout=12)
         if r.status_code != 200:
             return pd.DataFrame()
         try:
@@ -1029,7 +1029,7 @@ class DataEngine:
         last_err: Optional[Exception] = None
         for i in range(3):
             try:
-                resp = requests.get(url, params=params, timeout=10, proxies={"http": None, "https": None})
+                resp = requests.get(url, params=params, timeout=10)
                 resp.raise_for_status()
                 payload = resp.json()
                 klines = payload.get("data", {}).get("klines", []) if isinstance(payload, dict) else []

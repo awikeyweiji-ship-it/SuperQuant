@@ -70,7 +70,6 @@ def fetch(symbol: str, timeout: float = 6.0, retries: int = 1, **_: Any) -> Dict
                 params=params,
                 timeout=timeout,
                 headers=HEADERS,
-                proxies={"http": None, "https": None},
             )
             resp.raise_for_status()
             data = (resp.json() or {}).get("data") or {}

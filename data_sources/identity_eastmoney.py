@@ -30,7 +30,7 @@ def fetch_identity_em(code_std: str, timeout: int = 10) -> Dict[str, Any]:
     code_em = _to_em_code(code_std)
     url = "https://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/PageAjax"
     try:
-        resp = requests.get(url, params={"code": code_em}, timeout=timeout, proxies={"http": None, "https": None})
+        resp = requests.get(url, params={"code": code_em}, timeout=timeout)
         payload = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
     except Exception:
         return {}

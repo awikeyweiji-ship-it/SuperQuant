@@ -53,7 +53,7 @@ def _fetch_from_datacenter(code_std: str) -> Dict[str, Any]:
     }
     errors: List[Dict[str, str]] = []
     try:
-        resp = requests.get(url, params=params, timeout=8, proxies={"http": None, "https": None})
+        resp = requests.get(url, params=params, timeout=8)
         payload = resp.json() or {}
     except Exception as exc:  # noqa: BLE001
         errors.append({"source": "financial_eastmoney", "error_type": "exception", "message": str(exc)})

@@ -23,7 +23,7 @@ def _request_json(url: str, timeout: int = 10, retries: int = 1) -> Dict[str, An
     last_exc: Exception | None = None
     for attempt in range(max(1, retries + 1)):
         try:
-            resp = requests.get(url, timeout=timeout, headers=HEADERS, proxies={"http": None, "https": None})
+            resp = requests.get(url, timeout=timeout, headers=HEADERS)
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001

@@ -24,7 +24,7 @@ def fetch_hot_topics_em(limit: int = 10, timeout: int = 10, retries: int = 1) ->
     errors: List[Dict[str, str]] = []
     for attempt in range(max(1, retries + 1)):
         try:
-            resp = requests.get(url, timeout=timeout, headers=HEADERS, proxies={"http": None, "https": None})
+            resp = requests.get(url, timeout=timeout, headers=HEADERS)
             resp.raise_for_status()
             payload = resp.json() or {}
             break

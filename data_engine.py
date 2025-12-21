@@ -45,6 +45,7 @@ except Exception as exc:  # noqa: BLE001
 
 from logging_utils import get_data_logger, make_result, build_error, FetchResult
 from data_sources.provider_registry import ProviderRegistry, run_providers_parallel
+from data_sources.identity import canonical_identity
 from data_sources.quote_eastmoney import fetch as fetch_quote_eastmoney
 from data_sources.financial_eastmoney import fetch as fetch_financial_eastmoney
 from data_sources.moneyflow_eastmoney import fetch as fetch_moneyflow_eastmoney
@@ -91,16 +92,7 @@ def _now_str() -> str:
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def normalize_code(code: str) -> str:
-    code = str(code).strip()
-    code = re.sub(r"\.(SH|SZ|BJ|sh|sz|bj)$", "", code)
-    if code.isdigit():
-        code = code.zfill(6)
-    market = "SZ"
-    if code.startswith("6"):
-        market = "SH"
-    elif code.startswith(("8", "4")):
-        market = "BJ"
-    return f"{code}.{market}"
+    return canonical_identity(code).symbol
 
 
 # Backward-compatible alias
@@ -108,23 +100,13 @@ standardize_code = normalize_code
 
 
 def to_tencent_symbol(code: str) -> str:
-    code_std = standardize_code(code)
-    plain, market = code_std.split(".")
-    prefix = "sz"
-    if market == "SH":
-        prefix = "sh"
-    elif market == "BJ":
-        prefix = "bj"
-    return f"{prefix}{plain}"
+    ident = canonical_identity(code)
+    return ident.prefixed
 
 
 def to_eastmoney_secid(code: str) -> str:
-    code_std = standardize_code(code)
-    plain, market = code_std.split(".")
-    market_flag = "0"
-    if market == "SH":
-        market_flag = "1"
-    return f"{market_flag}.{plain}"
+    ident = canonical_identity(code)
+    return ident.secid
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     if x is None: return default
@@ -833,7 +815,8 @@ class DataEngine:
         return pd.DataFrame()
 
     def get_spot_row_structured(self, code: str, force_refresh: bool = False) -> FetchResult:
-        code_std = standardize_code(code)
+        ident = canonical_identity(code)
+        code_std = ident.symbol
         cache_key = self.cache.key("quote_v1", {"code": code_std})
         errors: List[Dict[str, str]] = []
         cache_age = self._cache_age(cache_key)
@@ -848,6 +831,7 @@ class DataEngine:
             code_std,
             timeout=8.0,
             retries=1,
+            identity=ident.to_dict(),
             force_refresh=force_refresh,
         )
 
@@ -1730,7 +1714,8 @@ class DataEngine:
         offline_mode: bool = False,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        code_std = standardize_code(code)
+        ident_obj = canonical_identity(code)
+        code_std = ident_obj.symbol
         if not sample_mode:
             os.environ["ALLOW_SAMPLE_CACHE"] = "0"
         if not offline_mode:
@@ -1791,6 +1776,7 @@ class DataEngine:
                 code_std,
                 timeout=8.0,
                 retries=1,
+                identity=ident_obj.to_dict(),
                 **kwargs,
             )
             provider_trace[domain] = traces

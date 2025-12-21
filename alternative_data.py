@@ -9,6 +9,7 @@ alternative_data.py
 2. **功能保持**: 完整保留 V9.0 的三级情报瀑布（个股-行业-宏观）。
 """
 
+import os
 import re
 import time
 import requests
@@ -73,6 +74,26 @@ class AlternativeDataEngine:
         self.macro_cache = {}
         self.cache = cache or UniverseCache()
         self.sentiment_ttl = 60 * 30
+        flag = os.environ.get("ALLOW_OFFLINE_SAMPLES", "").lower()
+        self.allow_offline_samples = flag in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _news_item(
+        title: str,
+        url: str,
+        source: str,
+        time_str: str = "",
+        summary: str = "",
+        raw_excerpt: str | None = None,
+    ) -> Dict[str, Any]:
+        return {
+            "title": title or "",
+            "url": url or "",
+            "source": source or "",
+            "time": time_str or "",
+            "summary": summary or (title[:120] if title else ""),
+            "raw_excerpt": raw_excerpt or "",
+        }
 
     @staticmethod
     def _news_item(
@@ -136,9 +157,14 @@ class AlternativeDataEngine:
             errors.append(build_error(name, "empty", f"{name} 无有效帖子"))
 
         if not chosen:
-            chosen = sample_sentiment(symbol)
-            source = "sample_cache"
-            errors.append(build_error("sample_cache", "fallback", "启用离线舆情样本，数据可能过期"))
+            if self.allow_offline_samples:
+                chosen = sample_sentiment(symbol)
+                source = "sample_cache"
+                errors.append(build_error("sample_cache", "fallback", "启用离线舆情样本，数据可能过期"))
+            else:
+                chosen = {"sample_posts": []}
+                source = "empty"
+                errors.append(build_error("sample_cache", "disabled", "未勾选离线样本模式，未返回占位数据"))
 
         self.cache.set(cache_key, chosen)
         return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
@@ -314,9 +340,14 @@ class AlternativeDataEngine:
             errors.append(build_error(name, "empty", f"{name} 公告为空"))
 
         if not chosen:
-            errors.append(build_error("sample", "fallback", "启用离线公告样本，数据可能过期"))
-            chosen = sample_announcements(symbol, limit=limit)
-            source = "sample_cache"
+            if self.allow_offline_samples:
+                errors.append(build_error("sample", "fallback", "启用离线公告样本，数据可能过期"))
+                chosen = sample_announcements(symbol, limit=limit)
+                source = "sample_cache"
+            else:
+                errors.append(build_error("sample", "disabled", "未勾选离线样本模式，公告未使用占位数据"))
+                chosen = []
+                source = "empty"
 
         return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
 
@@ -342,9 +373,14 @@ class AlternativeDataEngine:
             errors.append(build_error(name, "empty", f"{name} 研报为空"))
 
         if not chosen:
-            errors.append(build_error("sample", "fallback", "启用离线研报样本，数据可能过期"))
-            chosen = sample_reports(symbol, limit=limit)
-            source = "sample_cache"
+            if self.allow_offline_samples:
+                errors.append(build_error("sample", "fallback", "启用离线研报样本，数据可能过期"))
+                chosen = sample_reports(symbol, limit=limit)
+                source = "sample_cache"
+            else:
+                errors.append(build_error("sample", "disabled", "未勾选离线样本模式，研报未使用占位数据"))
+                chosen = []
+                source = "empty"
 
         return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
 
@@ -370,9 +406,14 @@ class AlternativeDataEngine:
             errors.append(build_error(name, "empty", f"{name} 热点为空"))
 
         if not chosen:
-            errors.append(build_error("sample", "fallback", "启用离线热点样本，数据可能过期"))
-            chosen = sample_hot_topics(limit=limit)
-            source = "sample_cache"
+            if self.allow_offline_samples:
+                errors.append(build_error("sample", "fallback", "启用离线热点样本，数据可能过期"))
+                chosen = sample_hot_topics(limit=limit)
+                source = "sample_cache"
+            else:
+                errors.append(build_error("sample", "disabled", "未勾选离线样本模式，热点未使用占位数据"))
+                chosen = []
+                source = "empty"
 
         return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
 

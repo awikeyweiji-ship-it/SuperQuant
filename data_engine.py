@@ -1215,20 +1215,6 @@ class DataEngine:
                 "pe_ttm": 15.0,
                 "pb": 1.5,
             },
-            "601872.SH": {
-                "report_date": "2024-09-30",
-                "revenue": 170.2 * 1e8,
-                "net_profit": 22.4 * 1e8,
-                "gross_margin": 32.5,
-                "net_margin": 13.2,
-                "roe": 8.7,
-                "roa": 5.1,
-                "debt_ratio": 55.0,
-                "op_cashflow": 30.0 * 1e8,
-                "profit_yoy": 9.5,
-                "revenue_yoy": 7.8,
-                "eps": 0.86,
-            },
         }
         return samples.get(code_std)
 

@@ -102,6 +102,13 @@ with st.sidebar.expander("🔑 神经连接 (API Keys)", expanded=True):
     st.session_state["api_key"] = ds_key
     st.session_state["tavily_key"] = tavily_key
 
+offline_mode = st.sidebar.checkbox(
+    "离线样本模式（允许使用本地样本 fallback）",
+    value=os.environ.get("ALLOW_OFFLINE_SAMPLES", "").lower() in {"1", "true", "yes", "on"},
+    help="默认关闭。仅在无网场景下手动勾选，才会使用本地样本/占位数据。",
+)
+os.environ["ALLOW_OFFLINE_SAMPLES"] = "1" if offline_mode else "0"
+
 # 初始化引擎 (单例模式)
 if "init_done" not in st.session_state:
     with st.spinner("系统自检中..."):
@@ -247,8 +254,9 @@ def _errors_count(errs) -> int:
 
 
 def _filled_from_meta(meta_obj: dict | None):
-    inner = _as_dict(_as_dict(meta_obj).get("meta"))
-    return inner.get("filled_metrics") or inner.get("count")
+    base = _as_dict(meta_obj)
+    inner = _as_dict(base.get("meta"))
+    return base.get("filled_metrics") or base.get("count") or inner.get("filled_metrics") or inner.get("count")
 
 
 def _render_meta(meta: dict | None):

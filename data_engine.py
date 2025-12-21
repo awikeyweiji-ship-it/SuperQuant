@@ -47,18 +47,23 @@ from logging_utils import get_data_logger, make_result, build_error, FetchResult
 from data_sources.provider_registry import ProviderRegistry, run_providers_parallel
 from data_sources.identity import canonical_identity
 from data_sources.quote_eastmoney import fetch as fetch_quote_eastmoney
+from data_sources.quote_sina import fetch as fetch_quote_sina
+from data_sources.kline_tencent import fetch as fetch_kline_tencent
 from data_sources.financial_eastmoney import fetch as fetch_financial_eastmoney
+from data_sources.financial_em_basic import fetch as fetch_financial_em_basic
 from data_sources.moneyflow_eastmoney import fetch as fetch_moneyflow_eastmoney
 from data_sources.identity_eastmoney import fetch_identity_em
 from data_sources.news_announcements_eastmoney import fetch as fetch_news_announcements
 from data_sources.news_reports_eastmoney import fetch as fetch_news_reports
 from data_sources.news_hot_eastmoney import fetch as fetch_news_hot
+from data_sources.news_sina import fetch as fetch_news_sina
 from data_sources.kline_eastmoney import fetch as fetch_kline_eastmoney
 from data_sources.announcement_eastmoney import (
     fetch_announcements_em,
     fetch_announcements_tencent,
     sample_announcements,
 )
+from data_sources.announcements_cninfo import fetch as fetch_announcements_cninfo
 from data_sources.report_eastmoney import (
     fetch_research_reports_em,
     fetch_research_reports_alt,
@@ -234,6 +239,12 @@ class DataEngine:
         # Quote providers
         self.provider_registry.register(
             "quote",
+            "quote_sina",
+            lambda code, **kwargs: self._provider_quote_module(code, fetch_quote_sina),
+            priority=20,
+        )
+        self.provider_registry.register(
+            "quote",
             "quote_eastmoney",
             lambda code, **kwargs: self._provider_quote_module(code, fetch_quote_eastmoney),
             priority=10,
@@ -252,6 +263,25 @@ class DataEngine:
         )
 
         # Financial & money flow providers
+        self.provider_registry.register(
+            "kline",
+            "kline_tencent",
+            lambda code, **kwargs: fetch_kline_tencent(code, limit=kwargs.get("limit", 400)),
+            priority=20,
+        )
+        self.provider_registry.register(
+            "kline",
+            "kline_eastmoney",
+            lambda code, **kwargs: fetch_kline_eastmoney(code, limit=kwargs.get("limit", 400)),
+            priority=10,
+        )
+
+        self.provider_registry.register(
+            "financial",
+            "financial_em_basic",
+            lambda code, **kwargs: fetch_financial_em_basic(code),
+            priority=20,
+        )
         self.provider_registry.register(
             "financial",
             "financial_eastmoney",
@@ -374,15 +404,19 @@ class DataEngine:
         meta_errors: List[Dict[str, str]] = []
         data = {"announcements": [], "reports": [], "hot_events": []}
 
-        for fetcher, key in [
+        providers = [
+            (fetch_announcements_cninfo, "announcements"),
+            (fetch_news_sina, "hot_events"),
             (fetch_news_announcements, "announcements"),
             (fetch_news_reports, "reports"),
             (fetch_news_hot, "hot_events"),
-        ]:
+        ]
+
+        for fetcher, key in providers:
             try:
                 payload = fetcher(code_std)
                 section = payload.get("data", {}).get(key, []) if isinstance(payload, dict) else []
-                if section:
+                if section and not data.get(key):
                     data[key] = section
                 meta_errors.extend(payload.get("meta", {}).get("errors", []) if isinstance(payload, dict) else [])
             except Exception as exc:  # noqa: BLE001
@@ -1746,31 +1780,8 @@ class DataEngine:
                 return {}
 
         identity = _safe_fetch(lambda: self.get_stock_identity_structured(code_std), "identity")
-        kline_payload = fetch_kline_eastmoney(code_std, limit=400)
-        kline_rows = []
-        if isinstance(kline_payload, dict):
-            kline_rows = kline_payload.get("data", {}).get("rows", []) if isinstance(kline_payload.get("data"), dict) else []
-        kline_rows = kline_rows or []
-        kline_meta = (kline_payload.get("meta", {}) if isinstance(kline_payload, dict) else {}) or {}
-        kline_meta.setdefault("filled_metrics", len(kline_rows))
-        kline_meta.setdefault("errors", [])
-        kline_meta.setdefault("source", "kline_eastmoney")
-        kline_data = {"daily": kline_rows}
-        basic_meta["kline"] = kline_meta
+        provider_trace: Dict[str, Any] = {}
 
-        # 并行 provider 域
-        provider_trace: Dict[str, Any] = {
-            "kline_daily": [
-                {
-                    "provider": "kline_eastmoney",
-                    "success": bool(kline_rows),
-                    "filled_metrics": len(kline_rows),
-                    "errors": kline_meta.get("errors", []),
-                    "errors_count": len(kline_meta.get("errors", [])),
-                    "used_key": kline_meta.get("used_key"),
-                }
-            ]
-        }
         def _run(domain: str, **kwargs: Any):
             payload, traces = run_providers_parallel(
                 self.provider_registry.get_providers(domain),
@@ -1802,6 +1813,19 @@ class DataEngine:
             payload["data"] = data
             payload["meta"] = meta
             return payload
+
+        # Kline via provider registry
+        kline_payload = _clean(_run("kline", limit=400))
+        kline_rows = []
+        if isinstance(kline_payload, dict):
+            kline_rows = kline_payload.get("data", {}).get("rows", []) if isinstance(kline_payload.get("data"), dict) else []
+        kline_rows = kline_rows or []
+        kline_meta = (kline_payload.get("meta", {}) if isinstance(kline_payload, dict) else {}) or {}
+        kline_meta.setdefault("filled_metrics", len(kline_rows))
+        kline_meta.setdefault("errors", [])
+        basic_meta["kline"] = kline_meta
+        kline_data = {"daily": kline_rows}
+        provider_trace["kline_daily"] = provider_trace.get("kline", [])
 
         quote_payload = _clean(_run("quote", force_refresh=force_refresh))
         financial_payload = _clean(_run("financial"))

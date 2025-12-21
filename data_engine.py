@@ -405,8 +405,11 @@ class DataEngine:
             except Exception as exc:  # noqa: BLE001
                 meta_errors.append(build_error(key, "exception", str(exc)))
 
-        if sum(1 for v in data.values() if v) < 2:
-            meta_errors.append(build_error("news_bundle", "insufficient", "至少需要两类非空情报"))
+        coverage = sum(1 for v in data.values() if v)
+        if coverage == 0:
+            meta_errors.append(build_error("news_bundle", "insufficient", "新闻、公告、热点均为空"))
+        elif coverage == 1:
+            meta_errors.append(build_error("news_bundle", "partial", "仅一类资讯可用，信心较低"))
 
         meta = {
             "source": "news_bundle_eastmoney",
@@ -1586,9 +1589,11 @@ class DataEngine:
             fallback_used = True
 
         coverage = sum(1 for k in ["announcements", "reports", "hot_events"] if bundle.get(k))
-        if coverage < 2:
-            errors.append(build_error("news_bundle", "insufficient", "至少需要两类非空情报"))
+        if coverage == 0:
+            errors.append(build_error("news_bundle", "insufficient", "公告、研报、热点均为空"))
             fallback_used = True
+        elif coverage == 1:
+            errors.append(build_error("news_bundle", "partial", "资讯来源只有一类，谨慎参考"))
         meta = {"sources": sources, "filled_sections": coverage, "retrieved_at": _now_str(), "filled_metrics": coverage}
         return make_result(bundle, source="news_bundle", errors=errors, fallback_used=fallback_used, meta=meta)
 
@@ -1608,8 +1613,10 @@ class DataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 公告为空"))
@@ -1637,8 +1644,10 @@ class DataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 研报为空"))
@@ -1665,8 +1674,10 @@ class DataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 热点为空"))
@@ -1857,8 +1868,12 @@ class DataEngine:
                 if money_data.get(key) in (None, "", "--"):
                     _add_missing(f"$.money_flow.{key}", f"资金流字段缺失: {key}")
 
-            if not news_data.get("announcements") and not news_data.get("reports") and not news_data.get("hot_events"):
+            news_sections = ["announcements", "reports", "hot_events"]
+            missing_news = [k for k in news_sections if not news_data.get(k)]
+            if len(missing_news) == len(news_sections):
                 _add_missing("$.news_bundle", "新闻/公告为空，需补充信息披露")
+            elif missing_news:
+                _add_missing("$.news_bundle.sections", f"资讯缺少: {', '.join(missing_news)}")
 
             if quote.get("price") is not None:
                 _add("$.quote.price", f"现价 {quote.get('price')}", quote.get("price"))
@@ -1919,17 +1934,30 @@ class DataEngine:
             if news_data.get("announcements") and news_data.get("reports"):
                 score += 1
 
-            action = "观望"
+            action = "WATCH"
             module_missing = any((diag_meta_map.get(m, {}).get("filled_metrics") or 0) == 0 for m in diag_meta_map)
-            if not module_missing and not missing_refs:
-                if score >= 3:
-                    action = "买"
-                elif score < 0:
-                    action = "回避"
-                else:
-                    action = "观望"
+            rationale_parts = []
+            if module_missing or missing_refs:
+                rationale_parts.append("数据不完整，采取保守决策")
 
-            rationale = "规则决策：估值、盈利、资金、资讯综合打分" if ev else "缺数据默认观望"
+            if not module_missing and ev:
+                if score >= 3:
+                    action = "BUY"
+                    rationale_parts.append("估值、盈利、资金、资讯综合得分较高")
+                elif score >= 1:
+                    action = "HOLD"
+                    rationale_parts.append("指标表现尚可，但需要持续跟踪")
+                elif score <= -1:
+                    action = "AVOID"
+                    rationale_parts.append("估值或资金流不利，暂不介入")
+                else:
+                    action = "WATCH"
+                    rationale_parts.append("信号中性，继续观察")
+            else:
+                action = "WATCH"
+                rationale_parts.append("关键模块缺失，仅提供观望建议")
+
+            rationale = "; ".join(rationale_parts) if rationale_parts else "规则决策：估值、盈利、资金、资讯综合打分"
             return {"evidence": ev, "action": action, "rationale": rationale, "missing_paths": missing_refs}
 
         advice_pack = _build_evidence_and_advice()

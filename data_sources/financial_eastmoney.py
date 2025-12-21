@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import akshare as ak
 import requests
@@ -51,20 +51,33 @@ def _fetch_from_datacenter(code_std: str) -> Dict[str, Any]:
         "source": "WEB",
         "client": "WEB",
     }
-    resp = requests.get(url, params=params, timeout=8, proxies={"http": None, "https": None})
-    data = (resp.json() or {}).get("result", {}).get("data") or []
-    if not data:
-        return {}
-    row = data[0]
-    return {
-        "pe_ttm": _to_float(row.get("PE_TTM")),
-        "pb": _to_float(row.get("PB")),
-        "roe": _to_float(row.get("AVG_ROE")),
-        "revenue_yoy": _to_float(row.get("OR_YOY")),
-        "profit_yoy": _to_float(row.get("NP_YOY")),
-        "gross_margin": _to_float(row.get("GROSSMARGIN")),
-        "report_period": row.get("REPORT_DATE"),
-    }
+    errors: List[Dict[str, str]] = []
+    try:
+        resp = requests.get(url, params=params, timeout=8, proxies={"http": None, "https": None})
+        payload = resp.json() or {}
+    except Exception as exc:  # noqa: BLE001
+        errors.append({"source": "financial_eastmoney", "error_type": "exception", "message": str(exc)})
+        return {"data": {}, "errors": errors}
+
+    try:
+        data_rows = payload.get("result", {}).get("data") if isinstance(payload, dict) else []
+        if not isinstance(data_rows, list) or not data_rows:
+            errors.append({"source": "financial_eastmoney", "error_type": "empty", "message": "no datacenter rows"})
+            return {"data": {}, "errors": errors}
+        row = data_rows[0] if isinstance(data_rows[0], dict) else {}
+        parsed = {
+            "pe_ttm": _to_float((row or {}).get("PE_TTM")),
+            "pb": _to_float((row or {}).get("PB")),
+            "roe": _to_float((row or {}).get("AVG_ROE")),
+            "revenue_yoy": _to_float((row or {}).get("OR_YOY")),
+            "profit_yoy": _to_float((row or {}).get("NP_YOY")),
+            "gross_margin": _to_float((row or {}).get("GROSSMARGIN")),
+            "report_period": (row or {}).get("REPORT_DATE"),
+        }
+        return {"data": parsed, "errors": errors}
+    except Exception as exc:  # noqa: BLE001
+        errors.append({"source": "financial_eastmoney", "error_type": "invalid", "message": str(exc)})
+        return {"data": {}, "errors": errors}
 
 
 def _akshare_indicator(code_std: str) -> Dict[str, Any]:
@@ -96,23 +109,31 @@ def fetch(symbol: str, **_: Any) -> Dict[str, Any]:
         "filled_metrics": 0,
     }
 
-    data = {}
-    try:
-        data = _fetch_from_datacenter(code_std)
-    except Exception as exc:  # noqa: BLE001
-        meta["errors"].append({"source": meta["source"], "error_type": "exception", "message": str(exc)})
+    data: Dict[str, Any] = {}
+    dc_payload = _fetch_from_datacenter(code_std)
+    dc_data = dc_payload.get("data", {}) if isinstance(dc_payload, dict) else {}
+    meta["errors"].extend(dc_payload.get("errors", []) if isinstance(dc_payload, dict) else [])
 
-    if not data:
-        try:
-            data = _akshare_indicator(code_std)
-            meta["fallback_used"] = True
-            meta["source"] = "financial_akshare"
-        except Exception as exc:  # noqa: BLE001
-            meta["errors"].append({"source": "financial_akshare", "error_type": "exception", "message": str(exc)})
+    if isinstance(dc_data, dict) and any(v not in (None, "", "--") for v in dc_data.values()):
+        data.update(dc_data)
+
+    try:
+        ak_data = _akshare_indicator(code_std)
+        if isinstance(ak_data, dict):
+            for key, val in ak_data.items():
+                if data.get(key) in (None, "", "--") and val not in (None, "", "--"):
+                    data[key] = val
+            if not data:
+                data = ak_data
+            if ak_data:
+                meta["fallback_used"] = meta["fallback_used"] or not dc_data
+                meta["source"] = "financial_akshare"
+    except Exception as exc:  # noqa: BLE001
+        meta["errors"].append({"source": "financial_akshare", "error_type": "exception", "message": str(exc)})
 
     meta["report_period"] = data.get("report_period")
     meta["filled_metrics"] = _count({k: v for k, v in data.items() if k != "report_period"})
-    if not data:
+    if meta["filled_metrics"] == 0:
         meta["errors"].append({"source": meta["source"], "error_type": "empty", "message": "no data"})
 
     return {"data": data, "meta": meta}

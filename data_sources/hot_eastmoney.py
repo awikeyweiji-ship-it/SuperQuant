@@ -13,26 +13,30 @@ HEADERS = {
 }
 
 
-def fetch_hot_topics_em(limit: int = 10, timeout: int = 10, retries: int = 1) -> List[Dict[str, Any]]:
-    """东财热门概念榜，返回主题及热度。"""
+def fetch_hot_topics_em(limit: int = 10, timeout: int = 10, retries: int = 1) -> Dict[str, Any]:
+    """东财热门概念榜，返回主题及热度（永不抛异常）。"""
+
     url = (
         f"https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz={limit}&po=1&np=1"
         "&fltt=2&invt=2&fid=f62&fs=m:90+t:2&fields=f12,f14,f62,f113,f128,f136"
     )
-    last_exc: Exception | None = None
+    payload: Dict[str, Any] = {}
+    errors: List[Dict[str, str]] = []
     for attempt in range(max(1, retries + 1)):
         try:
             resp = requests.get(url, timeout=timeout, headers=HEADERS, proxies={"http": None, "https": None})
             resp.raise_for_status()
-            payload = resp.json()
+            payload = resp.json() or {}
             break
         except Exception as exc:  # noqa: BLE001
-            last_exc = exc
+            errors.append({"source": "hot_eastmoney", "error_type": "exception", "message": str(exc)})
             if attempt < retries:
                 time.sleep(0.3 * (attempt + 1))
-            else:
-                raise
+
     items = payload.get("data", {}).get("diff", []) if isinstance(payload, dict) else []
+    if not isinstance(items, list):
+        errors.append({"source": "hot_eastmoney", "error_type": "invalid", "message": "unexpected payload"})
+        items = []
     out: List[Dict[str, Any]] = []
     for it in items:
         out.append(
@@ -47,7 +51,9 @@ def fetch_hot_topics_em(limit: int = 10, timeout: int = 10, retries: int = 1) ->
                 "reason": "概念热度榜",
             }
         )
-    return out
+    if not out and not errors:
+        errors.append({"source": "hot_eastmoney", "error_type": "empty", "message": "no hot topics"})
+    return {"items": out, "errors": errors}
 
 
 def fetch_hot_topics_ak(limit: int = 10) -> List[Dict[str, Any]]:

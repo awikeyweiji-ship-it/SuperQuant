@@ -17,6 +17,7 @@ import time
 import json
 import logging
 import sys
+import os
 import requests
 from typing import Dict, Any, Optional, List
 
@@ -29,6 +30,7 @@ import pandas as pd
 import numpy as np
 
 from logging_utils import get_data_logger, make_result, build_error, FetchResult
+from data_sources.provider_registry import ProviderRegistry, run_providers_parallel
 from data_sources.financial_eastmoney import fetch_financial_indicator_em
 from data_sources.identity_eastmoney import fetch_identity_em
 from data_sources.announcement_eastmoney import (
@@ -160,6 +162,8 @@ class DataEngine:
         # Step5: 财报/运营 + 资本运作 情报引擎
         self.fund_engine = FundamentalEngine(cache=self.cache) if FundamentalEngine else None
         self.capital_engine = CapitalEngine() if CapitalEngine else None
+        self.provider_registry = ProviderRegistry()
+        self._register_default_providers()
 
         self.sector_map = {}
         # 行情快照状态（用于 UI/调度自检）
@@ -180,6 +184,73 @@ class DataEngine:
         except Exception:
             return None
         return None
+
+    def _register_default_providers(self) -> None:
+        self.provider_registry.register("financial", "legacy_financial", lambda code: self._provider_financial(code), priority=5)
+        self.provider_registry.register("money_flow", "legacy_money_flow", lambda code: self._provider_money_flow(code), priority=5)
+        self.provider_registry.register("news_bundle", "legacy_news_bundle", lambda code: self._provider_news_bundle(code), priority=5)
+
+    @staticmethod
+    def _count_filled_fields(payload: Dict[str, Any]) -> int:
+        if not isinstance(payload, dict):
+            return 0
+        return sum(1 for _, v in payload.items() if v not in (None, "", "--"))
+
+    @staticmethod
+    def _sanitize_stub_data(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+        errors: List[Dict[str, str]] = []
+        if not isinstance(payload, dict):
+            return {}, errors
+        text_blob = json.dumps(payload, ensure_ascii=False, default=str)
+        if "example.com" in text_blob or "sample_cache" in text_blob or "offline_stub" in text_blob:
+            errors.append(build_error("validator", "stub_blocked", "过滤占位数据"))
+            return {}, errors
+        return payload, errors
+
+    def _fetchresult_to_provider_payload(self, fr: FetchResult, label: str) -> Dict[str, Any]:
+        data = fr.data
+        if hasattr(data, "to_dict") and not isinstance(data, dict):
+            try:
+                data = data.to_dict()  # type: ignore[assignment]
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data, blocked_errors = self._sanitize_stub_data(data)
+        errors = list(fr.errors or []) + blocked_errors
+        if (fr.source or "").startswith("sample") or (fr.source or "") in {"offline_stub", "sample_cache"}:
+            errors.append(build_error(fr.source or label, "disabled", "默认禁用样本数据"))
+            data = {}
+        meta = {
+            "source": fr.source or label,
+            "retrieved_at": time.time(),
+            "cache_hit": fr.cache_hit,
+            "cache_age": fr.cache_age,
+            "ttl_sec": None,
+            "fallback_used": fr.fallback_used or bool(blocked_errors),
+            "errors": errors,
+            "filled_metrics": self._count_filled_fields(data),
+        }
+        if isinstance(getattr(fr, "meta", None), dict):
+            meta.update(fr.meta)  # type: ignore[arg-type]
+            meta["filled_metrics"] = meta.get("filled_metrics", self._count_filled_fields(data))
+        return {"data": data, "meta": meta}
+
+    def _provider_financial(self, code: str) -> Dict[str, Any]:
+        res = self.get_financial_features_structured(code)
+        payload = self._fetchresult_to_provider_payload(res, "financial")
+        rp = payload["data"].get("report_period") or payload["data"].get("report_date")
+        if rp:
+            payload["meta"]["report_period"] = rp
+        return payload
+
+    def _provider_money_flow(self, code: str) -> Dict[str, Any]:
+        res = self.get_money_flow_structured(code)
+        return self._fetchresult_to_provider_payload(res, "money_flow")
+
+    def _provider_news_bundle(self, code: str) -> Dict[str, Any]:
+        res = self.get_news_bundle_structured(code)
+        return self._fetchresult_to_provider_payload(res, "news_bundle")
 
     def _market_prefix(self, code: str) -> str:
         code = normalize_code(code)
@@ -932,6 +1003,7 @@ class DataEngine:
         source_chain: List[str] = []
         fallback_used = False
         fin: Dict[str, Any] = {}
+        allow_samples = os.environ.get("ALLOW_SAMPLE_CACHE", "").lower() in {"1", "true", "yes", "on"} or os.environ.get("ALLOW_OFFLINE_SAMPLES", "").lower() in {"1", "true", "yes", "on"}
 
         # 1) 东财主路径
         em_errors: List[Dict[str, str]] = []
@@ -971,7 +1043,7 @@ class DataEngine:
         # 4) 离线样本补齐必填字段
         required_keys = ["pe_ttm", "pb", "roe", "revenue_yoy", "profit_yoy", "gross_margin"]
         filled_required = [k for k in required_keys if fin.get(k) not in (None, "", "--")]
-        if len(filled_required) < 4:
+        if len(filled_required) < 4 and allow_samples:
             stub = self._financial_offline_stub(code_std) or {}
             if stub:
                 for k, v in stub.items():
@@ -981,6 +1053,8 @@ class DataEngine:
                     source_chain.append("offline_stub")
                 errors.append(build_error("offline_stub", "used", "实时源不可用，使用内置示例财务数据，可能过期"))
                 fallback_used = True
+        elif len(filled_required) < 4 and not allow_samples:
+            errors.append(build_error("offline_stub", "disabled", "未启用样本模式，缺少必填财务字段"))
 
         # 4) 缓存兜底（不引入假数据）
         if not fin:
@@ -1000,7 +1074,7 @@ class DataEngine:
                 )
 
         # 5) 离线兜底（显式标注 fallback）
-        if not fin:
+        if not fin and allow_samples:
             fallback_used = True
             fin = self._financial_offline_stub(code_std) or {}
             if fin:
@@ -1008,6 +1082,8 @@ class DataEngine:
                 source_chain.append("offline_stub")
             else:
                 errors.append(build_error("financial", "unavailable", "所有财务数据源均失败"))
+        elif not fin:
+            errors.append(build_error("financial", "unavailable", "所有财务数据源均失败且禁用样本"))
 
         if not fin:
             return FetchResult(data={}, ok=False, source="unavailable", fallback_used=True, errors=errors)
@@ -1458,6 +1534,148 @@ class DataEngine:
     # -------------------------------------
     # 6. 全息打包
     # -------------------------------------
+    def single_stock(
+        self,
+        code: str,
+        sample_mode: bool = False,
+        offline_mode: bool = False,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        code_std = standardize_code(code)
+        if not sample_mode:
+            os.environ["ALLOW_SAMPLE_CACHE"] = "0"
+        if not offline_mode:
+            os.environ["ALLOW_OFFLINE_SAMPLES"] = "0"
+        # 基础链路
+        basic_meta: Dict[str, Any] = {}
+
+        def _safe_fetch(fn, label: str) -> Dict[str, Any]:
+            try:
+                res = fn()
+                data = res.data if isinstance(res.data, dict) else {}
+                data, blocked_errors = self._sanitize_stub_data(data)
+                meta = {
+                    "source": res.source or label,
+                    "fallback_used": res.fallback_used,
+                    "cache_hit": res.cache_hit,
+                    "cache_age": res.cache_age,
+                    "errors": list(res.errors or []) + blocked_errors,
+                    "ts": getattr(res, "ts", time.time()),
+                    "filled_metrics": self._count_filled_fields(data),
+                }
+                basic_meta[label] = meta
+                return data
+            except Exception as e:  # noqa: BLE001
+                meta = {"source": label, "errors": [build_error(label, "exception", str(e))], "fallback_used": True}
+                basic_meta[label] = meta
+                return {}
+
+        quote = _safe_fetch(lambda: self.get_spot_row_structured(code_std, force_refresh=force_refresh), "quote")
+        identity = _safe_fetch(lambda: self.get_stock_identity_structured(code_std), "identity")
+        kline_res = self.get_kline_structured(code_std, limit=120)
+        kline_meta = {
+            "source": kline_res.source,
+            "fallback_used": kline_res.fallback_used,
+            "cache_hit": kline_res.cache_hit,
+            "cache_age": kline_res.cache_age,
+            "errors": kline_res.errors,
+            "ts": getattr(kline_res, "ts", time.time()),
+        }
+        if hasattr(kline_res.data, "to_dict"):
+            try:
+                kline_data = kline_res.data.to_dict()
+            except Exception:
+                kline_data = {}
+        else:
+            kline_data = kline_res.data if isinstance(kline_res.data, dict) else {}
+        kline_data, blocked_kline = self._sanitize_stub_data(kline_data)
+        if blocked_kline:
+            kline_meta.setdefault("errors", []).extend(blocked_kline)
+            kline_meta["fallback_used"] = True
+        kline_meta["filled_metrics"] = self._count_filled_fields(kline_data)
+        basic_meta["kline"] = kline_meta
+
+        # 并行 provider 域
+        provider_trace: Dict[str, Any] = {}
+        def _run(domain: str):
+            payload, traces = run_providers_parallel(
+                self.provider_registry.get_providers(domain),
+                code_std,
+                timeout=8.0,
+            )
+            provider_trace[domain] = traces
+            return payload or {"data": {}, "meta": {"source": "unavailable", "errors": [build_error(domain, "empty", "无有效数据")], "filled_metrics": 0}}
+
+        financial_payload = _run("financial")
+        money_payload = _run("money_flow")
+        news_payload = _run("news_bundle")
+
+        # 汇总与 evidence
+        def _build_evidence() -> List[Dict[str, Any]]:
+            ev: List[Dict[str, Any]] = []
+            if quote.get("price"):
+                ev.append({"path": "quote.price", "value": quote.get("price"), "source": basic_meta.get("quote", {}).get("source")})
+            if identity.get("name"):
+                ev.append({"path": "identity.name", "value": identity.get("name"), "source": basic_meta.get("identity", {}).get("source")})
+            fin_data = financial_payload.get("data", {}) if isinstance(financial_payload, dict) else {}
+            for key in ["pe_ttm", "pb", "roe"]:
+                if fin_data.get(key) is not None:
+                    ev.append({"path": f"financial.{key}", "value": fin_data.get(key), "source": financial_payload.get("meta", {}).get("source")})
+            money_data = money_payload.get("data", {}) if isinstance(money_payload, dict) else {}
+            if money_data.get("main_net_inflow") is not None:
+                ev.append({"path": "money_flow.main_net_inflow", "value": money_data.get("main_net_inflow"), "source": money_payload.get("meta", {}).get("source")})
+            news_data = news_payload.get("data", {}) if isinstance(news_payload, dict) else {}
+            if news_data.get("announcements"):
+                first = news_data["announcements"][0]
+                ev.append({"path": "news_bundle.announcements[0].title", "value": first.get("title"), "source": news_payload.get("meta", {}).get("source")})
+            return ev[:8]
+
+        evidence_pack = _build_evidence()
+
+        meta_map = {
+            "quote": basic_meta.get("quote", {}),
+            "identity": basic_meta.get("identity", {}),
+            "kline": kline_meta,
+            "financial": financial_payload.get("meta", {}),
+            "money_flow": money_payload.get("meta", {}),
+            "news_bundle": news_payload.get("meta", {}),
+        }
+
+        diagnostics = []
+        for module_key, label in [
+            ("quote", "quote"),
+            ("identity", "identity"),
+            ("kline", "kline"),
+            ("financial", "financial"),
+            ("money_flow", "money_flow"),
+            ("news_bundle", "news_bundle"),
+        ]:
+            mm = meta_map.get(module_key, {})
+            diagnostics.append({
+                "module": module_key,
+                "source": mm.get("source"),
+                "fallback_used": mm.get("fallback_used"),
+                "cache_hit": mm.get("cache_hit"),
+                "ttl_sec": mm.get("ttl_sec"),
+                "retrieved_at": mm.get("retrieved_at") or mm.get("ts"),
+                "filled": mm.get("filled_metrics"),
+                "errors_count": len(mm.get("errors") or []),
+            })
+
+        return {
+            "code": code_std,
+            "quote": quote,
+            "identity": identity,
+            "kline": kline_data,
+            "financial": financial_payload.get("data", {}),
+            "money_flow": money_payload.get("data", {}),
+            "news_bundle": news_payload.get("data", {}),
+            "diagnostics": diagnostics,
+            "evidence_pack": evidence_pack,
+            "provider_trace": provider_trace,
+            "_meta": meta_map,
+        }
+
     def get_holistic_data(self, code: str) -> Dict[str, Any]:
         code = normalize_code(code)
         spot = self.get_spot_row(code)

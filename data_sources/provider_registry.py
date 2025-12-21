@@ -34,6 +34,7 @@ def run_providers_parallel(
     symbol: str,
     timeout: float = 8.0,
     retries: int = 0,
+    identity: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Execute providers in parallel and pick the best result.
@@ -78,6 +79,8 @@ def run_providers_parallel(
                     meta.setdefault("errors", [])
                     meta.setdefault("filled_metrics", 0)
                     meta.setdefault("errors_count", len(meta.get("errors") or []))
+                    if identity:
+                        meta.setdefault("used_key", identity)
                     traces.append(
                         {
                             "provider": entry.name,
@@ -130,5 +133,7 @@ def run_providers_parallel(
     meta = best_payload.get("meta") or {}
     meta.setdefault("source", best_entry.name)
     meta.setdefault("retrieved_at", time.time())
+    if identity:
+        meta.setdefault("used_key", identity)
     best_payload["meta"] = meta
     return best_payload, traces

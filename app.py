@@ -12,17 +12,18 @@ app.py
 
 import os
 import re
-from datetime import datetime
-from config_manager import get_config, update_keys, test_deepseek, test_tavily
-import pandas as pd
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional
+
 import numpy as np
+from config_manager import get_config, update_keys, test_deepseek, test_tavily
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # 引入核心组件
 from universe_cache import UniverseCache
-from data_engine import DataEngine, normalize_code
+from data_engine import DataEngine, normalize_code, standardize_code
 from market_scanner import MarketScanner, ScanConfig
 from deep_search_agent import DeepSearchAgent
 from radiation_engine import RadiationEngine
@@ -41,6 +42,33 @@ except Exception:
     save_weights = None
     load_weights = None
     run_factor_backtest = None
+
+
+# Optional pandas import to avoid pyarrow MemoryError on constrained hosts
+_PD_REF: Optional[Any] = None
+_PD_ERROR: Optional[str] = None
+
+
+def _get_pandas():
+    global _PD_REF, _PD_ERROR
+    if _PD_REF is not None or _PD_ERROR is not None:
+        return _PD_REF
+    try:
+        import pandas as pd  # type: ignore
+
+        _PD_REF = pd
+    except (ImportError, MemoryError) as exc:  # noqa: PIE786
+        _PD_ERROR = f"{exc.__class__.__name__}: {exc}"
+        _PD_REF = None
+    return _PD_REF
+
+
+def _pd_available() -> bool:
+    return _get_pandas() is not None
+
+
+def _pd_error_message() -> Optional[str]:
+    return _PD_ERROR
 
 
 # ==========================================
@@ -108,6 +136,19 @@ offline_mode = st.sidebar.checkbox(
     help="默认关闭。仅在无网场景下手动勾选，才会使用本地样本/占位数据。",
 )
 os.environ["ALLOW_OFFLINE_SAMPLES"] = "1" if offline_mode else "0"
+sample_mode = st.sidebar.checkbox("样本模式(允许 sample_cache)", value=False, help="默认关闭，开启后才允许读取 sample_cache 兜底")
+force_refresh = st.sidebar.checkbox("强制刷新", value=False, help="关闭缓存，强制拉取最新数据")
+os.environ["ALLOW_SAMPLE_CACHE"] = "1" if sample_mode else "0"
+os.environ["FORCE_REFRESH"] = "1" if force_refresh else "0"
+st.session_state["offline_mode_flag"] = offline_mode
+st.session_state["sample_mode"] = sample_mode
+st.session_state["force_refresh"] = force_refresh
+
+pd_err_msg = _pd_error_message()
+if pd_err_msg:
+    st.sidebar.warning(
+        "pandas 未加载，已切换为纯 Python 表格展示。错误: {}".format(pd_err_msg)
+    )
 
 # 初始化引擎 (单例模式)
 if "init_done" not in st.session_state:
@@ -192,55 +233,33 @@ def _safe_fetch(fn, label: str) -> FetchResult:
 
 
 def _safe_holistic(engine, code: str):
-    code_std = normalize_code(code)
-    # 结构化调用，保证 source/fallback/errors 可见
-    spot = _safe_fetch(lambda: engine.get_spot_row_structured(code_std), "quote")
-    identity = _safe_fetch(lambda: engine.get_stock_identity_structured(code_std), "identity")
-    kline = _safe_fetch(lambda: engine.get_kline_structured(code_std, freq="daily", limit=120), "kline")
-    fin = _safe_fetch(lambda: engine.get_financial_features_structured(code_std), "financial")
-    money = _safe_fetch(lambda: engine.get_money_flow_structured(code_std), "money_flow")
-
-    if getattr(engine, "alt_engine", None) is not None:
-        alt = _safe_fetch(lambda: engine.alt_engine.get_alternative_report_structured(code_std, sector=identity.data.get("sector", "")), "alternative")
-    else:
-        alt = make_result({}, source="alternative", fallback_used=True, errors=[build_error("alternative", "missing", "另类数据引擎未初始化")])
-
-    news_bundle = _safe_fetch(lambda: engine.get_news_bundle_structured(code_std), "news_bundle")
-
-    tech_brief = "无数据"
-    if hasattr(kline.data, "empty") and not kline.data.empty:
-        try:
-            last = kline.data.iloc[-1]
-            tech_brief = f"最新价: {last['close']} | 涨跌: {last['close'] - last['open']:.2f}"
-        except Exception:
-            tech_brief = "K线解析异常"
-
-    pack = {
-        "code": code_std,
-        "timestamp": _fmt_ts(datetime.now().timestamp()),
-        "identity": identity.data,
-        "market_data": spot.data,
-        "financials": fin.data,
-        "money_flow": money.data,
-        "technical_brief": tech_brief,
-        "alternative_intelligence": alt.data,
-        "macro_context": alt.data.get("macro_environment", {}) if isinstance(alt.data, dict) else {},
-        "corporate_news": alt.data.get("corporate_news", []) if isinstance(alt.data, dict) else [],
-        "macro_news": alt.data.get("macro_news", []) if isinstance(alt.data, dict) else [],
-        "news_bundle": news_bundle.data,
-        "kline": kline.data,
-    }
-
-    pack["_meta"] = {
-        "quote": spot.to_dict(),
-        "identity": identity.to_dict(),
-        "kline": kline.to_dict(),
-        "financial": fin.to_dict(),
-        "money_flow": money.to_dict(),
-        "alternative": alt.to_dict(),
-        "news_bundle": news_bundle.to_dict(),
-    }
-    return pack
+    code_std = standardize_code(code)
+    try:
+        res = engine.single_stock(
+            code_std,
+            sample_mode=st.session_state.get("sample_mode", False),
+            offline_mode=st.session_state.get("offline_mode_flag", False),
+            force_refresh=st.session_state.get("force_refresh", False),
+        )
+        meta = res.get("_meta") if isinstance(res, dict) else {}
+        res["_meta"] = meta if isinstance(meta, dict) else {}
+        res["market_data"] = res.get("quote", {})
+        res["financials"] = res.get("financial", {})
+        res["money_flow"] = res.get("money_flow", {})
+        return res
+    except Exception as e:  # noqa: BLE001
+        return {
+            "code": code_std,
+            "market_data": {},
+            "identity": {},
+            "financial": {},
+            "money_flow": {},
+            "news_bundle": {},
+            "diagnostics": [],
+            "evidence_pack": [],
+            "advice": {"action": "观望", "evidence": []},
+            "_meta": {"error": str(e)},
+        }
 
 
 def _as_dict(val: dict | None) -> dict:
@@ -273,7 +292,13 @@ def _render_meta(meta: dict | None):
     )
 
 
-def _minmax_norm(s: pd.Series) -> pd.Series:
+def _minmax_norm(s):
+    pd = _get_pandas()
+    if pd is None:
+        try:
+            return [0.5] * len(s)
+        except Exception:
+            return []
     s = pd.to_numeric(s, errors="coerce").fillna(0.0)
     if len(s) == 0:
         return s
@@ -283,7 +308,7 @@ def _minmax_norm(s: pd.Series) -> pd.Series:
     return (s - mn) / (mx - mn)
 
 
-def compute_entry_scores(df: pd.DataFrame) -> pd.DataFrame:
+def compute_entry_scores(df):
     """Compute entry_score for 'build position now' list.
 
     商用化闭环（Step4）：
@@ -291,7 +316,8 @@ def compute_entry_scores(df: pd.DataFrame) -> pd.DataFrame:
     - 使用权重学习输出 .w5brain_weights.json
     - 这里自动加载权重，把“慢变量”转成可迭代的建仓评分
     """
-    if df is None or df.empty:
+    pd = _get_pandas()
+    if pd is None or df is None or getattr(df, "empty", True):
         return df
     d = df.copy()
     base_col = "fused_score" if "fused_score" in d.columns else "score"
@@ -607,7 +633,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         md = _as_dict(dp.get('market_data'))
         c_h1.metric("现价", _fmt_val(md.get('close') or md.get('price')), _fmt_val(md.get('pct') or md.get('pct_chg'), suffix="%"))
         c_h2.metric("AI 综合评分", _fmt_val(rep.get('ai_score')))
-        
+
         # 决策高亮
         decision = rep.get('decision', '观望')
         color_cls = "decision-buy" if "买" in decision or "潜伏" in decision else "decision-sell" if "卖" in decision or "清" in decision else ""
@@ -615,6 +641,21 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         mc_val = md.get('market_cap')
         mc_display = _fmt_val(mc_val, suffix="亿") if mc_val not in (None, "", 0) else "—"
         c_h4.metric("市值", mc_display)
+
+        advice = _as_dict(dp.get("advice"))
+        if advice:
+            st.info(f"规则建议：{advice.get('action', '观望')}")
+            ev_list = advice.get("evidence") or []
+            if isinstance(ev_list, list):
+                for ev in ev_list:
+                    ref = _as_dict(ev).get("ref") or ""
+                    summary = _as_dict(ev).get("summary") or ""
+                    url = _as_dict(ev).get("url") or ""
+                    prefix = f"[{ref}] " if ref else ""
+                    if url:
+                        st.markdown(f"- {prefix}[{summary}]({url})")
+                    else:
+                        st.markdown(f"- {prefix}{summary}")
 
         with st.expander("🩺 数据链路诊断"):
             diag_rows = []
@@ -629,17 +670,21 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             ]:
                 safe_meta = _as_dict(meta)
                 diag_rows.append({
-                    "模块": label,
-                    "ok": safe_meta.get("ok"),
+                    "module": label,
                     "source": safe_meta.get("source") or "—",
-                    "fallback": safe_meta.get("fallback_used") or False,
+                    "fallback_used": safe_meta.get("fallback_used") or False,
                     "cache_hit": safe_meta.get("cache_hit") or False,
-                    "ts": _fmt_ts(safe_meta.get("ts")),
+                    "ttl_sec": safe_meta.get("ttl_sec") or "—",
+                    "retrieved_at": _fmt_ts(safe_meta.get("retrieved_at") or safe_meta.get("ts")),
                     "filled": _filled_from_meta(safe_meta) or "—",
-                    "errors": _errors_count(safe_meta.get("errors")),
+                    "errors_count": _errors_count(safe_meta.get("errors")),
                 })
             if diag_rows:
-                st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+                pd = _get_pandas()
+                if pd is not None:
+                    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+                else:
+                    st.table(diag_rows)
             for label, meta in [
                 ("行情", quote_meta),
                 ("身份", identity_meta),
@@ -759,8 +804,13 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 if not items:
                     continue
                 st.markdown(f"**{label} ({len(items)})**")
-                df_show = pd.DataFrame(items)[[c for c in ["title", "time", "source", "url", "summary"] if c in pd.DataFrame(items).columns]].head(5)
-                st.dataframe(df_show, use_container_width=True)
+                pd = _get_pandas()
+                if pd is not None:
+                    df_temp = pd.DataFrame(items)
+                    cols = [c for c in ["title", "time", "source", "url", "summary"] if c in df_temp.columns]
+                    st.dataframe(df_temp[cols].head(5), use_container_width=True)
+                else:
+                    st.table(items[:5])
             _render_meta(news_meta)
             if not (news_meta or {}).get("ok"):
                 _render_errors((news_meta or {}).get("errors"))
@@ -818,9 +868,9 @@ elif mode == "📦 模拟仓 (Paper Portfolio)":
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        start = st.date_input("开始日期", value=pd.to_datetime("2023-01-01"))
+        start = st.date_input("开始日期", value=datetime.fromisoformat("2023-01-01").date())
     with c2:
-        end = st.date_input("结束日期", value=pd.to_datetime("today"))
+        end = st.date_input("结束日期", value=datetime.today().date())
     with c3:
         initial_cash = st.number_input("初始资金", min_value=10000, value=1000000, step=10000)
 
@@ -868,14 +918,18 @@ elif mode == "📦 模拟仓 (Paper Portfolio)":
                 st.plotly_chart(fig, use_container_width=True)
 
             trades = res.get("trades")
-            if trades is not None and not trades.empty:
+            if trades is not None and not getattr(trades, "empty", True):
                 st.subheader("交易记录")
                 st.dataframe(trades, use_container_width=True, height=320)
 
             pos = res.get("positions")
             if pos is not None and len(pos):
                 st.subheader("期末持仓")
-                st.dataframe(pd.DataFrame(pos).sort_values("weight", ascending=False), use_container_width=True, height=260)
+                pd = _get_pandas()
+                if pd is not None:
+                    st.dataframe(pd.DataFrame(pos).sort_values("weight", ascending=False), use_container_width=True, height=260)
+                else:
+                    st.table(pos)
 
 elif mode == "📊 策略回测 (Time Machine)":
     st.title("📊 五维超脑·时光机")
@@ -893,8 +947,8 @@ elif mode == "📊 策略回测 (Time Machine)":
 
         c1, c2, c3, c4 = st.columns(4)
         bt_code = c1.text_input("回测标的", "600519")
-        bt_start = c2.date_input("开始日期", value=pd.to_datetime("2023-01-01"))
-        bt_end = c3.date_input("结束日期", value=pd.to_datetime("2023-12-31"))
+        bt_start = c2.date_input("开始日期", value=datetime.fromisoformat("2023-01-01").date())
+        bt_end = c3.date_input("结束日期", value=datetime.fromisoformat("2023-12-31").date())
         bt_cash = c4.number_input("初始资金", value=100000)
 
         if st.button("🔴 启动单股回测", type="primary"):
@@ -913,10 +967,15 @@ elif mode == "📊 策略回测 (Time Machine)":
             with st.status("时光倒流中...", expanded=True):
                 runner.run()
             if getattr(runner, 'history', None):
-                df_res = pd.DataFrame(runner.history)
-                st.dataframe(df_res, use_container_width=True)
-                if 'date' in df_res.columns and 'total' in df_res.columns:
-                    st.line_chart(df_res.set_index('date')['total'])
+                pd = _get_pandas()
+                history = runner.history
+                if pd is not None:
+                    df_res = pd.DataFrame(history)
+                    st.dataframe(df_res, use_container_width=True)
+                    if 'date' in df_res.columns and 'total' in df_res.columns:
+                        st.line_chart(df_res.set_index('date')['total'])
+                else:
+                    st.table(history)
 
     with t2:
         st.subheader("权重学习 (Ridge Regression)")
@@ -927,7 +986,7 @@ elif mode == "📊 策略回测 (Time Machine)":
         else:
             colA, colB, colC, colD = st.columns(4)
             f_start = colA.text_input("样本开始", "2023-01-01")
-            f_end = colB.text_input("样本结束", pd.Timestamp.today().strftime("%Y-%m-%d"))
+            f_end = colB.text_input("样本结束", datetime.today().strftime("%Y-%m-%d"))
             horizon = int(colC.number_input("预测周期(天)", value=5, min_value=1, max_value=60))
             l2 = float(colD.number_input("L2强度(Ridge)", value=10.0, min_value=0.0))
 
@@ -968,7 +1027,7 @@ elif mode == "📊 策略回测 (Time Machine)":
         else:
             c1, c2, c3, c4, c5 = st.columns(5)
             bt_start2 = c1.text_input("开始", "2023-01-01")
-            bt_end2 = c2.text_input("结束", pd.Timestamp.today().strftime("%Y-%m-%d"))
+            bt_end2 = c2.text_input("结束", datetime.today().strftime("%Y-%m-%d"))
             horizon2 = int(c3.number_input("持有(天)", value=5, min_value=1, max_value=60))
             topk = int(c4.number_input("TopK", value=20, min_value=5, max_value=100))
             reb = c5.selectbox("调仓", ["W", "D", "M"], index=0)
@@ -994,7 +1053,10 @@ elif mode == "📊 策略回测 (Time Machine)":
                 else:
                     st.success(f"完成：总收益 {out.get('total_return'):.2%} | CAGR≈ {out.get('cagr_approx'):.2%} | MDD {out.get('max_drawdown'):.2%} | 胜率 {out.get('win_rate'):.2%}")
                     curve = out.get('curve')
-                    if isinstance(curve, pd.DataFrame) and not curve.empty:
+                    pd = _get_pandas()
+                    if pd is not None and isinstance(curve, pd.DataFrame) and not curve.empty:
                         st.dataframe(curve, use_container_width=True)
                         if 'date' in curve.columns and 'equity' in curve.columns:
                             st.line_chart(curve.set_index('date')['equity'])
+                    elif curve:
+                        st.table(curve)

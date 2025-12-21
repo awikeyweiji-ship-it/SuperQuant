@@ -1,8 +1,4 @@
-"""快速校验核心字段缩放与覆盖率。
-
-运行示例：
-    python scripts/smoke_data_integrity.py 600519.SH 000001.SZ 601872
-"""
+"""Integrity check for single stock payload produced by DataEngine.single_stock."""
 from __future__ import annotations
 
 import json
@@ -17,71 +13,87 @@ from data_engine import DataEngine, standardize_code
 from universe_cache import UniverseCache
 
 
-def summarize_quote(q: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "price": q.get("price"),
-        "pct_chg": q.get("pct_chg"),
-        "amount": q.get("amount"),
-        "vol": q.get("vol"),
-        "market_cap": q.get("market_cap"),
-        "pe_ttm": q.get("pe_ttm"),
-        "pb": q.get("pb"),
-        "source": q.get("source"),
-    }
+REQUIRED_FIN_KEYS = ["pe_ttm", "pb", "roe", "report_period"]
+NETWORK_KEYWORDS = [
+    "network is unreachable",
+    "connection refused",
+    "timed out",
+    "max retries",
+    "proxy",
+]
+
+
+def validate(stock: Dict[str, Any]) -> List[str]:
+    failures: List[str] = []
+    meta = stock.get("_meta", {}) if isinstance(stock, dict) else {}
+    fin_meta = meta.get("financial", {}) if isinstance(meta, dict) else {}
+    if not fin_meta.get("retrieved_at") and not fin_meta.get("ts"):
+        failures.append("missing_financial_retrieved_at")
+    rp = fin_meta.get("report_period")
+    if rp in ("2003-12-31", "", None):
+        failures.append("invalid_report_period")
+
+    fin = stock.get("financial", {}) if isinstance(stock, dict) else {}
+    for key in REQUIRED_FIN_KEYS:
+        if fin.get(key) in (None, "", "--"):
+            failures.append(f"financial_missing_{key}")
+            break
+
+    serialized = json.dumps(stock, ensure_ascii=False, default=str)
+    if "example.com" in serialized:
+        failures.append("example_stub_detected")
+    return failures
 
 
 def main() -> int:
     codes = sys.argv[1:] if len(sys.argv) > 1 else ["600519.SH", "000001.SZ", "601872.SH"]
     engine = DataEngine(cache=UniverseCache())
     report: List[Dict[str, Any]] = []
+    any_failures = False
 
     for raw in codes:
         code_std = standardize_code(raw)
-        entry: Dict[str, Any] = {"code": code_std, "checks": []}
+        payload = engine.single_stock(code_std)
+        failures = validate(payload)
+        diagnostics = payload.get("diagnostics") or [] if isinstance(payload, dict) else []
+        provider_trace = payload.get("provider_trace") or {}
+        diag_map = {d.get("module"): d for d in diagnostics if isinstance(d, dict)}
+        module_results: List[Dict[str, Any]] = []
+        for module in ["quote", "financial", "money_flow", "news_bundle"]:
+            info = diag_map.get(module, {})
+            filled = info.get("filled") or 0
+            err_cnt = info.get("errors_count") or 0
+            traces = provider_trace.get(module) if isinstance(provider_trace, dict) else []
+            status = "OK"
+            module_failures: List[str] = []
+            if filled == 0:
+                module_failures.append(f"{module}_filled_zero")
+            if err_cnt > 0:
+                module_failures.append(f"{module}_errors_{err_cnt}")
+            for tr in traces or []:
+                msg_blob = json.dumps(tr, ensure_ascii=False).lower()
+                if any(kw in msg_blob for kw in NETWORK_KEYWORDS):
+                    status = "INCONCLUSIVE"
+                    module_failures.append(f"{module}_network_blocked")
+            if module_failures:
+                status = "FAIL" if status == "OK" else status
+                failures.extend(module_failures)
+            module_results.append(
+                {
+                    "module": module,
+                    "filled_metrics": filled,
+                    "errors_count": err_cnt,
+                    "status": status,
+                    "provider_trace": traces,
+                    "missing_paths": info.get("missing_paths") or [],
+                }
+            )
 
-        quote_res = engine.get_spot_row_structured(code_std)
-        quote = quote_res.data if isinstance(quote_res.data, dict) else {}
-        anomalies: List[str] = []
-        price = quote.get("price")
-        if price is None or price <= 0 or price > 10000:
-            anomalies.append("price_out_of_range")
-        pct = quote.get("pct_chg")
-        if pct is None or abs(pct) > 20:
-            anomalies.append("pct_suspect")
-        if quote.get("market_cap") in (None, 0):
-            anomalies.append("market_cap_missing")
-        entry["quote"] = {
-            "summary": summarize_quote(quote),
-            "source": quote_res.source,
-            "fallback_used": quote_res.fallback_used,
-            "errors": quote_res.errors,
-            "anomalies": anomalies,
-        }
+        any_failures = any_failures or bool(failures)
+        report.append({"code": code_std, "failures": failures, "module_results": module_results})
 
-        fin_res = engine.get_financial_features_structured(code_std)
-        fin = fin_res.data if isinstance(fin_res.data, dict) else {}
-        filled = [k for k, v in fin.items() if v not in (None, "", "--")]
-        entry["financial"] = {
-            "filled_metrics": len(filled),
-            "source": fin_res.source,
-            "fallback_used": fin_res.fallback_used,
-            "errors": fin_res.errors,
-        }
-
-        money_res = engine.get_money_flow_structured(code_std)
-        money = money_res.data if isinstance(money_res.data, dict) else {}
-        filled_money = [k for k, v in money.items() if v not in (None, "")]
-        entry["money_flow"] = {
-            "filled_metrics": len(filled_money),
-            "source": money_res.source,
-            "fallback_used": money_res.fallback_used,
-            "errors": money_res.errors,
-        }
-
-        report.append(entry)
-
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 1 if any_failures else 0
 
 
 if __name__ == "__main__":

@@ -236,14 +236,15 @@ def _safe_holistic(engine, code: str):
     return pack
 
 
-def _render_meta(meta: dict):
+def _render_meta(meta: dict | None):
+    meta = meta or {}
     src = meta.get("source", "-")
     fb = "是" if meta.get("fallback_used") else "否"
     cache = "命中" if meta.get("cache_hit") else "未命中"
     ts_str = _fmt_ts(meta.get("ts"))
     filled = None
-    if isinstance(meta.get("meta"), dict):
-        filled = meta.get("meta", {}).get("filled_metrics") or meta.get("meta", {}).get("count")
+    inner_meta = meta.get("meta", {}) if isinstance(meta.get("meta"), dict) else {}
+    filled = inner_meta.get("filled_metrics") or inner_meta.get("count")
     st.caption(f"来源: {src} | fallback: {fb} | 缓存: {cache} | 时间: {ts_str} | 覆盖: {filled if filled is not None else '—'}")
 
 
@@ -562,13 +563,13 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         dp = st.session_state['dp']
         news_bundle = dp.get("news_bundle") if isinstance(dp, dict) else {}
         meta_map = dp.get("_meta", {}) if isinstance(dp, dict) else {}
-        quote_meta = meta_map.get("quote", {})
-        identity_meta = meta_map.get("identity", {})
-        kline_meta = meta_map.get("kline", {})
-        fin_meta = meta_map.get("financial", {})
-        money_meta = meta_map.get("money_flow", {})
-        alt_meta = meta_map.get("alternative", {})
-        news_meta = meta_map.get("news_bundle", {})
+        quote_meta = meta_map.get("quote") or {}
+        identity_meta = meta_map.get("identity") or {}
+        kline_meta = meta_map.get("kline") or {}
+        fin_meta = meta_map.get("financial") or {}
+        money_meta = meta_map.get("money_flow") or {}
+        alt_meta = meta_map.get("alternative") or {}
+        news_meta = meta_map.get("news_bundle") or {}
 
         # 1. 核心决策头 (Header)
         st.markdown("---")
@@ -600,6 +601,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 ("alternative", "情报", alt_meta),
                 ("news_bundle", "情报流", news_meta),
             ]:
+                meta = meta or {}
                 meta_meta = meta.get("meta", {}) if isinstance(meta, dict) else {}
                 diag_rows.append({
                     "模块": label,
@@ -609,11 +611,20 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                     "cache_hit": meta.get("cache_hit"),
                     "ts": _fmt_ts(meta.get("ts")),
                     "filled": meta_meta.get("filled_metrics") or meta_meta.get("count"),
-                    "errors": len(meta.get("errors", [])),
+                    "errors": len(meta.get("errors") or []),
                 })
             if diag_rows:
                 st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
-            for label, meta in [("行情", quote_meta), ("身份", identity_meta), ("K线", kline_meta), ("财务", fin_meta), ("资金", money_meta), ("情报", alt_meta), ("情报流", news_meta)]:
+            for label, meta in [
+                ("行情", quote_meta),
+                ("身份", identity_meta),
+                ("K线", kline_meta),
+                ("财务", fin_meta),
+                ("资金", money_meta),
+                ("情报", alt_meta),
+                ("情报流", news_meta),
+            ]:
+                meta = meta or {}
                 if meta.get("errors"):
                     st.markdown(f"**{label}错误详情:**")
                     _render_errors(meta.get("errors"))
@@ -671,39 +682,43 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         with tab_kline:
             st.caption("支持滚轮缩放与拖拽")
             col_k1, col_k2, col_k3 = st.columns(3)
-            with col_k1:
-                plot_kline(dp['code'], 'daily', "日线 (Daily)")
-            with col_k2:
-                plot_kline(dp['code'], 'weekly', "周线 (Weekly)")
-            with col_k3:
-                plot_kline(dp['code'], 'monthly', "月线 (Monthly)")
+            kline_code = dp.get('code') or code_input
+            if not kline_code:
+                st.warning("暂无代码，无法绘制 K 线")
+            else:
+                with col_k1:
+                    plot_kline(kline_code, 'daily', "日线 (Daily)")
+                with col_k2:
+                    plot_kline(kline_code, 'weekly', "周线 (Weekly)")
+                with col_k3:
+                    plot_kline(kline_code, 'monthly', "月线 (Monthly)")
             _render_meta(kline_meta)
-            if not kline_meta.get("ok"):
-                _render_errors(kline_meta.get("errors"))
+            if not (kline_meta or {}).get("ok"):
+                _render_errors((kline_meta or {}).get("errors"))
 
         # --- Tab 3: 深度逻辑 (Logic) ---
         with tab_logic:
             body = rep.get('analysis_body', {})
-            
+
             c_l1, c_l2 = st.columns(2)
             with c_l1:
                 st.markdown("#### 🏛️ 宏观与行业 (Macro & Industry)")
                 st.info(body.get('macro_policy', '无数据'))
-                
+
                 st.markdown("#### 🏭 基本面与技术 (Fundamental & Tech)")
                 st.info(body.get('industry_tech', '无数据'))
-                
+
             with c_l2:
                 st.markdown("#### 💸 资金与博弈 (Money & Game)")
                 st.warning(body.get('funds_sentiment', '无数据'))
 
                 st.markdown("#### 🗣️ 舆情与情绪 (Sentiment)")
-                sent = dp['alternative_intelligence']
+                sent = dp.get('alternative_intelligence') or {}
                 st.write(f"散户情绪分: {_fmt_val(sent.get('retail_sentiment'))}")
                 st.text(f"股吧样本: {sent.get('raw_guba_sample')}")
                 _render_meta(alt_meta)
-                if not alt_meta.get("ok"):
-                    _render_errors(alt_meta.get("errors"))
+                if not (alt_meta or {}).get("ok"):
+                    _render_errors((alt_meta or {}).get("errors"))
 
             st.divider()
             st.markdown("#### 📡 情报流 (公告 / 研报 / 热点 / 论坛)")
@@ -722,8 +737,8 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 df_show = pd.DataFrame(items)[[c for c in ["title", "time", "source", "url", "summary"] if c in pd.DataFrame(items).columns]].head(5)
                 st.dataframe(df_show, use_container_width=True)
             _render_meta(news_meta)
-            if not news_meta.get("ok"):
-                _render_errors(news_meta.get("errors"))
+            if not (news_meta or {}).get("ok"):
+                _render_errors((news_meta or {}).get("errors"))
 
         # --- Tab 4: 财务与资金 (Fundamentals) ---
         with tab_fund:
@@ -735,16 +750,16 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             c_f4.metric("营收增长", _fmt_val(fin.get('revenue_yoy'), suffix="%"))
             st.write(f"报告期: {_fmt_val(fin.get('report_date'))}")
             _render_meta(fin_meta)
-            if not fin_meta.get("ok"):
-                _render_errors(fin_meta.get("errors"))
+            if not (fin_meta or {}).get("ok"):
+                _render_errors((fin_meta or {}).get("errors"))
 
             st.markdown("---")
             money = dp.get('money_flow') or {}
             st.metric("今日主力净流入", _fmt_val(money.get('main_net_inflow_today'), suffix=" 万"))
             st.write(f"北向: {_fmt_val(money.get('north_money_net'))} | 两融: {_fmt_val(money.get('margin_balance_delta'))}")
             _render_meta(money_meta)
-            if not money_meta.get("ok"):
-                _render_errors(money_meta.get("errors"))
+            if not (money_meta or {}).get("ok"):
+                _render_errors((money_meta or {}).get("errors"))
             st.caption("注：财务/资金均展示来源与兜底信息，失败时可据 errors 快速定位。")
 
 

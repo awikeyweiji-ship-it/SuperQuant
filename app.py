@@ -108,6 +108,13 @@ offline_mode = st.sidebar.checkbox(
     help="默认关闭。仅在无网场景下手动勾选，才会使用本地样本/占位数据。",
 )
 os.environ["ALLOW_OFFLINE_SAMPLES"] = "1" if offline_mode else "0"
+sample_mode = st.sidebar.checkbox("样本模式(允许 sample_cache)", value=False, help="默认关闭，开启后才允许读取 sample_cache 兜底")
+force_refresh = st.sidebar.checkbox("强制刷新", value=False, help="关闭缓存，强制拉取最新数据")
+os.environ["ALLOW_SAMPLE_CACHE"] = "1" if sample_mode else "0"
+os.environ["FORCE_REFRESH"] = "1" if force_refresh else "0"
+st.session_state["offline_mode_flag"] = offline_mode
+st.session_state["sample_mode"] = sample_mode
+st.session_state["force_refresh"] = force_refresh
 
 # 初始化引擎 (单例模式)
 if "init_done" not in st.session_state:
@@ -193,54 +200,31 @@ def _safe_fetch(fn, label: str) -> FetchResult:
 
 def _safe_holistic(engine, code: str):
     code_std = normalize_code(code)
-    # 结构化调用，保证 source/fallback/errors 可见
-    spot = _safe_fetch(lambda: engine.get_spot_row_structured(code_std), "quote")
-    identity = _safe_fetch(lambda: engine.get_stock_identity_structured(code_std), "identity")
-    kline = _safe_fetch(lambda: engine.get_kline_structured(code_std, freq="daily", limit=120), "kline")
-    fin = _safe_fetch(lambda: engine.get_financial_features_structured(code_std), "financial")
-    money = _safe_fetch(lambda: engine.get_money_flow_structured(code_std), "money_flow")
-
-    if getattr(engine, "alt_engine", None) is not None:
-        alt = _safe_fetch(lambda: engine.alt_engine.get_alternative_report_structured(code_std, sector=identity.data.get("sector", "")), "alternative")
-    else:
-        alt = make_result({}, source="alternative", fallback_used=True, errors=[build_error("alternative", "missing", "另类数据引擎未初始化")])
-
-    news_bundle = _safe_fetch(lambda: engine.get_news_bundle_structured(code_std), "news_bundle")
-
-    tech_brief = "无数据"
-    if hasattr(kline.data, "empty") and not kline.data.empty:
-        try:
-            last = kline.data.iloc[-1]
-            tech_brief = f"最新价: {last['close']} | 涨跌: {last['close'] - last['open']:.2f}"
-        except Exception:
-            tech_brief = "K线解析异常"
-
-    pack = {
-        "code": code_std,
-        "timestamp": _fmt_ts(datetime.now().timestamp()),
-        "identity": identity.data,
-        "market_data": spot.data,
-        "financials": fin.data,
-        "money_flow": money.data,
-        "technical_brief": tech_brief,
-        "alternative_intelligence": alt.data,
-        "macro_context": alt.data.get("macro_environment", {}) if isinstance(alt.data, dict) else {},
-        "corporate_news": alt.data.get("corporate_news", []) if isinstance(alt.data, dict) else [],
-        "macro_news": alt.data.get("macro_news", []) if isinstance(alt.data, dict) else [],
-        "news_bundle": news_bundle.data,
-        "kline": kline.data,
-    }
-
-    pack["_meta"] = {
-        "quote": spot.to_dict(),
-        "identity": identity.to_dict(),
-        "kline": kline.to_dict(),
-        "financial": fin.to_dict(),
-        "money_flow": money.to_dict(),
-        "alternative": alt.to_dict(),
-        "news_bundle": news_bundle.to_dict(),
-    }
-    return pack
+    try:
+        res = engine.single_stock(
+            code_std,
+            sample_mode=st.session_state.get("sample_mode", False),
+            offline_mode=st.session_state.get("offline_mode_flag", False),
+            force_refresh=st.session_state.get("force_refresh", False),
+        )
+        meta = res.get("_meta") if isinstance(res, dict) else {}
+        res["_meta"] = meta if isinstance(meta, dict) else {}
+        res["market_data"] = res.get("quote", {})
+        res["financials"] = res.get("financial", {})
+        res["money_flow"] = res.get("money_flow", {})
+        return res
+    except Exception as e:  # noqa: BLE001
+        return {
+            "code": code_std,
+            "market_data": {},
+            "identity": {},
+            "financial": {},
+            "money_flow": {},
+            "news_bundle": {},
+            "diagnostics": [],
+            "evidence_pack": [],
+            "_meta": {"error": str(e)},
+        }
 
 
 def _as_dict(val: dict | None) -> dict:
@@ -629,14 +613,14 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             ]:
                 safe_meta = _as_dict(meta)
                 diag_rows.append({
-                    "模块": label,
-                    "ok": safe_meta.get("ok"),
+                    "module": label,
                     "source": safe_meta.get("source") or "—",
-                    "fallback": safe_meta.get("fallback_used") or False,
+                    "fallback_used": safe_meta.get("fallback_used") or False,
                     "cache_hit": safe_meta.get("cache_hit") or False,
-                    "ts": _fmt_ts(safe_meta.get("ts")),
+                    "ttl_sec": safe_meta.get("ttl_sec") or "—",
+                    "retrieved_at": _fmt_ts(safe_meta.get("retrieved_at") or safe_meta.get("ts")),
                     "filled": _filled_from_meta(safe_meta) or "—",
-                    "errors": _errors_count(safe_meta.get("errors")),
+                    "errors_count": _errors_count(safe_meta.get("errors")),
                 })
             if diag_rows:
                 st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)

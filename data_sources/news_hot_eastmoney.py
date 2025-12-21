@@ -11,8 +11,10 @@ def fetch(symbol: str, limit: int = 15, **_: Any) -> Dict[str, Any]:
     errors: List[Dict[str, str]] = []
     items: List[Dict[str, Any]] = []
     try:
-        rows = fetch_hot_topics_em(limit=limit)
-        for row in rows:
+        payload = fetch_hot_topics_em(limit=limit)
+        rows = payload.get("items", []) if isinstance(payload, dict) else payload
+        errors.extend(payload.get("errors", []) if isinstance(payload, dict) else [])
+        for row in rows or []:
             url = row.get("url") or ""
             ts = row.get("time") or time.strftime("%Y-%m-%d")
             if not url or "example.com" in url:
@@ -29,6 +31,9 @@ def fetch(symbol: str, limit: int = 15, **_: Any) -> Dict[str, Any]:
             )
     except Exception as exc:  # noqa: BLE001
         errors.append({"source": "news_hot_eastmoney", "error_type": "exception", "message": str(exc)})
+
+    if not items and not errors:
+        errors.append({"source": "news_hot_eastmoney", "error_type": "empty", "message": "no hot events"})
 
     meta = {
         "source": "news_hot_eastmoney",

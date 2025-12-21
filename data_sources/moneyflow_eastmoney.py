@@ -64,7 +64,7 @@ def fetch(symbol: str, **_: Any) -> Dict[str, Any]:
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
     }
     try:
-        resp = requests.get(url, params=params, timeout=8, proxies={"http": None, "https": None})
+        resp = requests.get(url, params=params, timeout=8)
         raw_data = (resp.json() or {}).get("data") or {}
         klines = raw_data.get("klines") or []
         if not klines:

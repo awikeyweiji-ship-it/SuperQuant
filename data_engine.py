@@ -45,6 +45,7 @@ except Exception as exc:  # noqa: BLE001
 
 from logging_utils import get_data_logger, make_result, build_error, FetchResult
 from data_sources.provider_registry import ProviderRegistry, run_providers_parallel
+from data_sources.identity import canonical_identity
 from data_sources.quote_eastmoney import fetch as fetch_quote_eastmoney
 from data_sources.financial_eastmoney import fetch as fetch_financial_eastmoney
 from data_sources.moneyflow_eastmoney import fetch as fetch_moneyflow_eastmoney
@@ -52,6 +53,7 @@ from data_sources.identity_eastmoney import fetch_identity_em
 from data_sources.news_announcements_eastmoney import fetch as fetch_news_announcements
 from data_sources.news_reports_eastmoney import fetch as fetch_news_reports
 from data_sources.news_hot_eastmoney import fetch as fetch_news_hot
+from data_sources.kline_eastmoney import fetch as fetch_kline_eastmoney
 from data_sources.announcement_eastmoney import (
     fetch_announcements_em,
     fetch_announcements_tencent,
@@ -91,16 +93,7 @@ def _now_str() -> str:
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def normalize_code(code: str) -> str:
-    code = str(code).strip()
-    code = re.sub(r"\.(SH|SZ|BJ|sh|sz|bj)$", "", code)
-    if code.isdigit():
-        code = code.zfill(6)
-    market = "SZ"
-    if code.startswith("6"):
-        market = "SH"
-    elif code.startswith(("8", "4")):
-        market = "BJ"
-    return f"{code}.{market}"
+    return canonical_identity(code).symbol
 
 
 # Backward-compatible alias
@@ -108,23 +101,13 @@ standardize_code = normalize_code
 
 
 def to_tencent_symbol(code: str) -> str:
-    code_std = standardize_code(code)
-    plain, market = code_std.split(".")
-    prefix = "sz"
-    if market == "SH":
-        prefix = "sh"
-    elif market == "BJ":
-        prefix = "bj"
-    return f"{prefix}{plain}"
+    ident = canonical_identity(code)
+    return ident.prefixed
 
 
 def to_eastmoney_secid(code: str) -> str:
-    code_std = standardize_code(code)
-    plain, market = code_std.split(".")
-    market_flag = "0"
-    if market == "SH":
-        market_flag = "1"
-    return f"{market_flag}.{plain}"
+    ident = canonical_identity(code)
+    return ident.secid
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     if x is None: return default
@@ -405,8 +388,11 @@ class DataEngine:
             except Exception as exc:  # noqa: BLE001
                 meta_errors.append(build_error(key, "exception", str(exc)))
 
-        if sum(1 for v in data.values() if v) < 2:
-            meta_errors.append(build_error("news_bundle", "insufficient", "至少需要两类非空情报"))
+        coverage = sum(1 for v in data.values() if v)
+        if coverage == 0:
+            meta_errors.append(build_error("news_bundle", "insufficient", "新闻、公告、热点均为空"))
+        elif coverage == 1:
+            meta_errors.append(build_error("news_bundle", "partial", "仅一类资讯可用，信心较低"))
 
         meta = {
             "source": "news_bundle_eastmoney",
@@ -437,7 +423,7 @@ class DataEngine:
             px = self._market_prefix(code)
             q = f's_{px}{code}'
             url = f'https://qt.gtimg.cn/q={q}'
-            r = requests.get(url, timeout=8, proxies={"http": None, "https": None})
+            r = requests.get(url, timeout=8)
             txt = (r.text or '').strip()
             if '~' not in txt:
                 return {}
@@ -496,7 +482,7 @@ class DataEngine:
             "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f170,f71,f84,f162,f167,f116,f117",
         }
         try:
-            r = requests.get(url, params=params, timeout=10, proxies={"http": None, "https": None})
+            r = requests.get(url, params=params, timeout=10)
             data = (r.json() or {}).get("data") or {}
             if not data:
                 return {}
@@ -714,7 +700,7 @@ class DataEngine:
             "Accept": "application/json,text/plain,*/*",
             "Referer": "https://quote.eastmoney.com/",
         }
-        r = requests.get(url, params=params, headers=headers, timeout=12, proxies={"http": None, "https": None})
+        r = requests.get(url, params=params, headers=headers, timeout=12)
         if r.status_code != 200:
             return pd.DataFrame()
         try:
@@ -830,7 +816,8 @@ class DataEngine:
         return pd.DataFrame()
 
     def get_spot_row_structured(self, code: str, force_refresh: bool = False) -> FetchResult:
-        code_std = standardize_code(code)
+        ident = canonical_identity(code)
+        code_std = ident.symbol
         cache_key = self.cache.key("quote_v1", {"code": code_std})
         errors: List[Dict[str, str]] = []
         cache_age = self._cache_age(cache_key)
@@ -845,6 +832,7 @@ class DataEngine:
             code_std,
             timeout=8.0,
             retries=1,
+            identity=ident.to_dict(),
             force_refresh=force_refresh,
         )
 
@@ -1026,12 +1014,13 @@ class DataEngine:
         last_err: Optional[Exception] = None
         for i in range(3):
             try:
-                resp = requests.get(url, params=params, timeout=10, proxies={"http": None, "https": None})
+                resp = requests.get(url, params=params, timeout=10)
                 resp.raise_for_status()
                 payload = resp.json()
                 klines = payload.get("data", {}).get("klines", []) if isinstance(payload, dict) else []
                 if not klines:
-                    return pd.DataFrame()
+                    last_err = Exception("empty kline data")
+                    continue
                 records = []
                 for line in klines:
                     parts = str(line).split(",")
@@ -1053,8 +1042,7 @@ class DataEngine:
                 last_err = e
                 time.sleep(delay)
                 delay *= 2
-        if last_err:
-            raise last_err
+        # best-effort: never raise, just return empty on failures
         return pd.DataFrame()
 
     def _offline_stub_kline(self, limit: Optional[int], freq: str) -> pd.DataFrame:
@@ -1586,9 +1574,11 @@ class DataEngine:
             fallback_used = True
 
         coverage = sum(1 for k in ["announcements", "reports", "hot_events"] if bundle.get(k))
-        if coverage < 2:
-            errors.append(build_error("news_bundle", "insufficient", "至少需要两类非空情报"))
+        if coverage == 0:
+            errors.append(build_error("news_bundle", "insufficient", "公告、研报、热点均为空"))
             fallback_used = True
+        elif coverage == 1:
+            errors.append(build_error("news_bundle", "partial", "资讯来源只有一类，谨慎参考"))
         meta = {"sources": sources, "filled_sections": coverage, "retrieved_at": _now_str(), "filled_metrics": coverage}
         return make_result(bundle, source="news_bundle", errors=errors, fallback_used=fallback_used, meta=meta)
 
@@ -1608,8 +1598,10 @@ class DataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 公告为空"))
@@ -1637,8 +1629,10 @@ class DataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 研报为空"))
@@ -1665,8 +1659,10 @@ class DataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 热点为空"))
@@ -1719,7 +1715,8 @@ class DataEngine:
         offline_mode: bool = False,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        code_std = standardize_code(code)
+        ident_obj = canonical_identity(code)
+        code_std = ident_obj.symbol
         if not sample_mode:
             os.environ["ALLOW_SAMPLE_CACHE"] = "0"
         if not offline_mode:
@@ -1749,37 +1746,38 @@ class DataEngine:
                 return {}
 
         identity = _safe_fetch(lambda: self.get_stock_identity_structured(code_std), "identity")
-        kline_res = self.get_kline_structured(code_std, limit=120)
-        kline_meta = {
-            "source": kline_res.source,
-            "fallback_used": kline_res.fallback_used,
-            "cache_hit": kline_res.cache_hit,
-            "cache_age": kline_res.cache_age,
-            "errors": kline_res.errors,
-            "ts": getattr(kline_res, "ts", time.time()),
-        }
-        if hasattr(kline_res.data, "to_dict"):
-            try:
-                kline_data = kline_res.data.to_dict()
-            except Exception:
-                kline_data = {}
-        else:
-            kline_data = kline_res.data if isinstance(kline_res.data, dict) else {}
-        kline_data, blocked_kline = self._sanitize_stub_data(kline_data)
-        if blocked_kline:
-            kline_meta.setdefault("errors", []).extend(blocked_kline)
-            kline_meta["fallback_used"] = True
-        kline_meta["filled_metrics"] = self._count_filled_fields(kline_data)
+        kline_payload = fetch_kline_eastmoney(code_std, limit=400)
+        kline_rows = []
+        if isinstance(kline_payload, dict):
+            kline_rows = kline_payload.get("data", {}).get("rows", []) if isinstance(kline_payload.get("data"), dict) else []
+        kline_rows = kline_rows or []
+        kline_meta = (kline_payload.get("meta", {}) if isinstance(kline_payload, dict) else {}) or {}
+        kline_meta.setdefault("filled_metrics", len(kline_rows))
+        kline_meta.setdefault("errors", [])
+        kline_meta.setdefault("source", "kline_eastmoney")
+        kline_data = {"daily": kline_rows}
         basic_meta["kline"] = kline_meta
 
         # 并行 provider 域
-        provider_trace: Dict[str, Any] = {}
+        provider_trace: Dict[str, Any] = {
+            "kline_daily": [
+                {
+                    "provider": "kline_eastmoney",
+                    "success": bool(kline_rows),
+                    "filled_metrics": len(kline_rows),
+                    "errors": kline_meta.get("errors", []),
+                    "errors_count": len(kline_meta.get("errors", [])),
+                    "used_key": kline_meta.get("used_key"),
+                }
+            ]
+        }
         def _run(domain: str, **kwargs: Any):
             payload, traces = run_providers_parallel(
                 self.provider_registry.get_providers(domain),
                 code_std,
                 timeout=8.0,
                 retries=1,
+                identity=ident_obj.to_dict(),
                 **kwargs,
             )
             provider_trace[domain] = traces
@@ -1819,6 +1817,7 @@ class DataEngine:
             fin_data = financial_payload.get("data", {}) if isinstance(financial_payload, dict) else {}
             money_data = money_payload.get("data", {}) if isinstance(money_payload, dict) else {}
             news_data = news_payload.get("data", {}) if isinstance(news_payload, dict) else {}
+            kline_rows_local = kline_rows
             missing_refs: List[str] = []
 
             diag_meta_map = {
@@ -1857,8 +1856,29 @@ class DataEngine:
                 if money_data.get(key) in (None, "", "--"):
                     _add_missing(f"$.money_flow.{key}", f"资金流字段缺失: {key}")
 
-            if not news_data.get("announcements") and not news_data.get("reports") and not news_data.get("hot_events"):
+            news_sections = ["announcements", "reports", "hot_events"]
+            missing_news = [k for k in news_sections if not news_data.get(k)]
+            if len(missing_news) == len(news_sections):
                 _add_missing("$.news_bundle", "新闻/公告为空，需补充信息披露")
+            elif missing_news:
+                _add_missing("$.news_bundle.sections", f"资讯缺少: {', '.join(missing_news)}")
+
+            if not kline_rows_local:
+                _add_missing("$.kline.daily", "日线为空，需检查行情链路")
+            else:
+                last_row = kline_rows_local[-1]
+                _add("$.kline.daily.last_close", f"最新收盘 {last_row.get('close')} @ {last_row.get('date')}", last_row.get("close"))
+                if len(kline_rows_local) >= 2:
+                    prev_row = kline_rows_local[-2]
+                    if isinstance(prev_row, dict) and prev_row.get("close") is not None and last_row.get("close") is not None:
+                        mom = (float(last_row["close"]) - float(prev_row["close"])) / float(prev_row["close"]) * 100
+                        _add("$.kline.daily.momentum", f"近1日动量 {mom:.2f}%", mom)
+                if len(kline_rows_local) >= 20:
+                    closes = [r.get("close") for r in kline_rows_local[-20:] if isinstance(r, dict)]
+                    closes = [c for c in closes if c is not None]
+                    if closes:
+                        avg20 = sum(closes) / len(closes)
+                        _add("$.kline.daily.avg20", f"20日均价 {avg20:.2f}", avg20)
 
             if quote.get("price") is not None:
                 _add("$.quote.price", f"现价 {quote.get('price')}", quote.get("price"))
@@ -1919,17 +1939,30 @@ class DataEngine:
             if news_data.get("announcements") and news_data.get("reports"):
                 score += 1
 
-            action = "观望"
+            action = "WATCH"
             module_missing = any((diag_meta_map.get(m, {}).get("filled_metrics") or 0) == 0 for m in diag_meta_map)
-            if not module_missing and not missing_refs:
-                if score >= 3:
-                    action = "买"
-                elif score < 0:
-                    action = "回避"
-                else:
-                    action = "观望"
+            rationale_parts = []
+            if module_missing or missing_refs:
+                rationale_parts.append("数据不完整，采取保守决策")
 
-            rationale = "规则决策：估值、盈利、资金、资讯综合打分" if ev else "缺数据默认观望"
+            if not module_missing and ev:
+                if score >= 3:
+                    action = "BUY"
+                    rationale_parts.append("估值、盈利、资金、资讯综合得分较高")
+                elif score >= 1:
+                    action = "HOLD"
+                    rationale_parts.append("指标表现尚可，但需要持续跟踪")
+                elif score <= -1:
+                    action = "AVOID"
+                    rationale_parts.append("估值或资金流不利，暂不介入")
+                else:
+                    action = "WATCH"
+                    rationale_parts.append("信号中性，继续观察")
+            else:
+                action = "WATCH"
+                rationale_parts.append("关键模块缺失，仅提供观望建议")
+
+            rationale = "; ".join(rationale_parts) if rationale_parts else "规则决策：估值、盈利、资金、资讯综合打分"
             return {"evidence": ev, "action": action, "rationale": rationale, "missing_paths": missing_refs}
 
         advice_pack = _build_evidence_and_advice()
@@ -1948,14 +1981,14 @@ class DataEngine:
         for module_key, label in [
             ("quote", "quote"),
             ("identity", "identity"),
-            ("kline", "kline"),
+            ("kline", "kline_daily"),
             ("financial", "financial"),
             ("money_flow", "money_flow"),
             ("news_bundle", "news_bundle"),
         ]:
             mm = meta_map.get(module_key, {})
             diagnostics.append({
-                "module": module_key,
+                "module": label,
                 "source": mm.get("source"),
                 "fallback_used": mm.get("fallback_used"),
                 "cache_hit": mm.get("cache_hit"),

@@ -51,7 +51,7 @@ def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
         failures.append("contains_example_stub")
 
     diag_map = {d.get("module"): d for d in diag if isinstance(d, dict)}
-    for module in ["quote", "financial", "money_flow", "news_bundle"]:
+    for module in ["quote", "financial", "money_flow", "news_bundle", "kline_daily"]:
         info = diag_map.get(module, {})
         filled = info.get("filled") or 0
         err_cnt = info.get("errors_count") or 0
@@ -89,7 +89,7 @@ def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
             val = nb.get(key) or []
             if val:
                 first = val[0]
-                for req in ["title", "source"]:
+                for req in ["title", "time", "url"]:
                     if not first.get(req):
                         failures.append(f"news_{key}_missing_{req}")
             else:
@@ -97,8 +97,13 @@ def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
     return {"diagnostics": diag, "failures": failures, "module_results": module_results}
 
 
+def _fail(message: str) -> None:
+    print(f"[SMOKE][FAIL] {message}")
+    raise SystemExit(1)
+
+
 def main() -> int:
-    inputs = sys.argv[1:] if len(sys.argv) > 1 else ["600519.SH", "000001.SZ", "601872.SH"]
+    inputs = sys.argv[1:] if len(sys.argv) > 1 else ["600519", "000001"]
     engine = DataEngine(cache=UniverseCache())
     reports: List[Dict[str, Any]] = []
     any_failures = False
@@ -108,17 +113,48 @@ def main() -> int:
         stock = engine.single_stock(code_std)
         validation = validate_payload(stock)
         module_results = validation.get("module_results") or []
+        evidence_len = len(stock.get("evidence_pack") or [])
+        nb = stock.get("news_bundle") or {}
+        if evidence_len < 12:
+            validation["failures"].append("evidence_pack_too_short")
+        if not any((nb.get("announcements") or []) + (nb.get("reports") or []) + (nb.get("hot_events") or [])):
+            validation["failures"].append("news_bundle_empty")
+        kline_daily = stock.get("kline", {}).get("daily") if isinstance(stock.get("kline"), dict) else None
+        if not kline_daily or len(kline_daily) < 120:
+            validation["failures"].append("kline_daily_short")
+        else:
+            # ensure ascending dates and numeric fields
+            dates = [row.get("date") for row in kline_daily if isinstance(row, dict)]
+            if dates != sorted(dates):
+                validation["failures"].append("kline_daily_not_sorted")
+            for row in kline_daily[:3]:
+                for key in ["open", "close", "high", "low", "volume"]:
+                    if row.get(key) in (None, "--", ""):
+                        validation["failures"].append("kline_daily_bad_numeric")
+
+        quote = stock.get("quote") or {}
+        if quote.get("price") in (None, "--", 0):
+            validation["failures"].append("quote_price_missing")
+        if quote.get("pct_chg") in (None, "--"):
+            validation["failures"].append("quote_pct_missing")
+        if quote.get("amount") in (None, "--"):
+            validation["failures"].append("quote_amount_missing")
+
         entry = {
             "code": code_std,
             "failures": validation.get("failures"),
             "diagnostics": validation.get("diagnostics"),
             "module_results": module_results,
+            "evidence_len": evidence_len,
+            "quote": quote,
         }
         reports.append(entry)
         any_failures = any_failures or bool(validation.get("failures"))
 
     print(json.dumps(reports, ensure_ascii=False, indent=2))
-    return 1 if any_failures else 0
+    if any_failures:
+        _fail("single_stock smoke validations failed")
+    return 0
 
 
 if __name__ == "__main__":

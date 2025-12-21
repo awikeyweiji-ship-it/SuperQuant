@@ -250,7 +250,9 @@ class OpportunityRadar:
 
             # 数据覆盖度与依据摘要
             row["data_gaps"] = self._gap_summary(policy_pack, fund_pack, flow_pack, macro_pack)
-            row["evidence"] = self._build_evidence(row)
+            evidence_list, evidence_text = self._build_evidence(row)
+            row["evidence_points"] = evidence_list
+            row["evidence"] = evidence_text
 
             # 综合评分
             weights = self.weights
@@ -321,7 +323,7 @@ class OpportunityRadar:
             evidences.append(f"舆情热词: {row['sentiment_words']}")
         if row.get("macro_comment"):
             evidences.append(f"宏观: {row['macro_comment']}")
-        return " | ".join(evidences)
+        return evidences, " | ".join(evidences)
 
 
 if __name__ == "__main__":

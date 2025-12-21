@@ -1,31 +1,114 @@
-﻿# Python cache
+﻿# =========================
+# Python bytecode / cache
+# =========================
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
 *.pyo
 *.pyd
-.streamlit/
-**/__pycache__/
-.superquant_cache/
-*.pkl
-*.parquet
-*.meta.json
-*.cache
+*$py.class
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
-# Virtual env
+# =========================
+# Virtual environments
+# =========================
 venv/
 .venv/
 env/
+ENV/
 
-# IDE
+# common venv layout on Windows / Linux
+Lib/site-packages/
+lib/python*/site-packages/
+site-packages/
+**/site-packages/
+
+# pip metadata folders (often appear if site-packages got committed)
+*.dist-info/
+**/*.dist-info/
+*.egg-info/
+**/*.egg-info/
+*.data/
+**/*.data/
+
+# binary wheels
+*.so
+*.dll
+*.dylib
+
+# =========================
+# Streamlit (keep config, ignore secrets)
+# =========================
+.streamlit/secrets.toml
+.streamlit/*.secrets*
+.streamlit/*secret*
+
+# =========================
+# SuperQuant caches / artifacts
+# =========================
+.superquant_cache/
+*.parquet
+*.pkl
+*.meta.json
+*.cache
+*.local.cache
+*.log
+
+# If you generate local DB/cache files
+*.sqlite
+*.db
+
+# =========================
+# IDE / OS
+# =========================
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
+desktop.ini
 
+# =========================
 # Secrets
+# =========================
 .env
+.env.*
 
-# Local cache & temp artifacts
+# =========================
+# Accidentally committed pip packages at repo root (add as needed)
+# =========================
+numpy/
+pandas/
+akshare/
+
+aiohttp/
+aiohappyeyeballs/
+aiosignal/
+yarl/
+websockets/
+websocket/
+websocket_client/
+
+yaml/
+xlrd/
+zipp/
+
+# =========================
+# Local scratch files
+# =========================
 deep_audit.py
-*.local.cache
+# =========================
+# pip vendor modules accidentally sitting at repo root
+# (requests + deps, etc.)
+# =========================
+certifi/
+charset_normalizer/
+idna/
+requests/
+urllib3/
+
+

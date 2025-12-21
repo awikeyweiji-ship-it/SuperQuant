@@ -602,7 +602,8 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 ("news_bundle", "情报流", news_meta),
             ]:
                 meta = meta or {}
-                meta_meta = meta.get("meta", {}) if isinstance(meta, dict) else {}
+                raw_meta = meta.get("meta") if isinstance(meta, dict) else {}
+                meta_meta = raw_meta if isinstance(raw_meta, dict) else {}
                 diag_rows.append({
                     "模块": label,
                     "ok": meta.get("ok"),

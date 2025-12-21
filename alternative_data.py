@@ -12,8 +12,8 @@ alternative_data.py
 import re
 import time
 import requests
-import datetime
-from typing import Dict, Any, List
+import datetime as _dt
+from typing import Dict, Any, List, Tuple
 
 from logging_utils import make_result, build_error, FetchResult
 from universe_cache import UniverseCache
@@ -73,6 +73,24 @@ class AlternativeDataEngine:
         self.macro_cache = {}
         self.cache = cache or UniverseCache()
         self.sentiment_ttl = 60 * 30
+
+    @staticmethod
+    def _news_item(
+        title: str,
+        url: str,
+        source: str,
+        time_str: str = "",
+        summary: str = "",
+        raw_excerpt: str | None = None,
+    ) -> Dict[str, Any]:
+        return {
+            "title": title or "",
+            "url": url or "",
+            "source": source or "",
+            "time": time_str or "",
+            "summary": summary or (title[:120] if title else ""),
+            "raw_excerpt": raw_excerpt or "",
+        }
 
     def _calculate_sentiment(self, text: str) -> float:
         if not text or not jieba: return 0.0
@@ -357,6 +375,111 @@ class AlternativeDataEngine:
             source = "sample_cache"
 
         return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
+
+    # ------------------------------------------------------------------
+    # 新闻流聚合（公告 / 研报 / 热点 / 论坛 / 观点）
+    # ------------------------------------------------------------------
+    def get_news_bundle_structured(self, symbol: str, sector: str = "") -> FetchResult:
+        errors: List[Dict[str, str]] = []
+        bundle = {
+            "announcements": [],
+            "reports": [],
+            "hot_events": [],
+            "forums": [],
+            "opinions": [],
+        }
+
+        ann = self.fetch_announcements(symbol)
+        rep = self.fetch_research_reports(symbol)
+        hot = self.fetch_hot_topics(limit=8)
+        senti = self.fetch_guba_sentiment(symbol, limit=12)
+        smart_news = self.fetch_smart_news(symbol, sector)
+
+        for src in [ann, rep, hot, senti, smart_news]:
+            if not src.ok:
+                errors.extend(src.errors)
+
+        # 公告
+        for item in (ann.data or []):
+            bundle["announcements"].append(
+                self._news_item(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    source=f"announcement_{ann.source or 'unknown'}",
+                    time_str=str(item.get("date") or item.get("time") or ""),
+                    summary=item.get("type") or item.get("title", ""),
+                )
+            )
+
+        # 研报
+        for item in (rep.data or []):
+            bundle["reports"].append(
+                self._news_item(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    source=f"report_{rep.source or 'unknown'}",
+                    time_str=str(item.get("date") or ""),
+                    summary=f"{item.get('org','')} {item.get('rating','')}".strip(),
+                )
+            )
+
+        # 热点/要事
+        for item in (hot.data or []):
+            bundle["hot_events"].append(
+                self._news_item(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    source=f"hot_{hot.source or 'unknown'}",
+                    time_str=str(item.get("time") or item.get("date") or ""),
+                    summary=item.get("reason") or item.get("desc") or item.get("title", ""),
+                )
+            )
+
+        # 论坛帖子
+        senti_posts = []
+        if isinstance(senti.data, dict):
+            senti_posts = senti.data.get("sample_posts") or []
+        for item in senti_posts:
+            bundle["forums"].append(
+                self._news_item(
+                    title=item.get("summary", ""),
+                    url=item.get("url", ""),
+                    source=item.get("source", senti.source or "forum"),
+                    time_str=str(item.get("time") or ""),
+                    summary=item.get("summary", "")[:140],
+                    raw_excerpt=item.get("summary", ""),
+                )
+            )
+
+        # 舆情观点/公司新闻
+        smart_data = smart_news.data if isinstance(smart_news.data, dict) else {}
+        for item in smart_data.get("corporate", []) + smart_data.get("macro", []):
+            bundle["opinions"].append(
+                self._news_item(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    source=f"smart_news_{smart_news.source or 'unknown'}",
+                    time_str=str(item.get("date") or item.get("time") or ""),
+                    summary=item.get("tag") or item.get("title", ""),
+                )
+            )
+
+        # 统计 meta
+        filled_metrics = sum(1 for k, v in bundle.items() if v)
+        meta = {
+            "source": "alternative_data",
+            "fallback_used": len(errors) > 0,
+            "errors": errors,
+            "retrieved_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "count": {k: len(v) for k, v in bundle.items()},
+            "filled_metrics": filled_metrics,
+        }
+
+        fallback_used = len(errors) > 0 and filled_metrics < 2
+        if filled_metrics < 2:
+            errors.append(build_error("news_bundle", "insufficient", "至少需要两类非空情报"))
+
+        return make_result(bundle, source="news_bundle", errors=errors, fallback_used=fallback_used, meta=meta)
 
     # ------------------------------------------------------------------
     # 主入口 (修复点：增加 sector 参数)

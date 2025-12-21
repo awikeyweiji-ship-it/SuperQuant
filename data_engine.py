@@ -1216,9 +1216,19 @@ class DataEngine:
     # 5.4 公告 / 研报 / 热点要事
     # -------------------------------------
     def get_news_bundle_structured(self, code: str, limit: int = 8) -> FetchResult:
-        """聚合公告/研报/热点/论坛发声，保证结构稳定。"""
+        """聚合公告/研报/热点/论坛/观点，优先使用情报引擎统一 schema。"""
 
         code_std = standardize_code(code)
+        if self.alt_engine and hasattr(self.alt_engine, "get_news_bundle_structured"):
+            try:
+                return self.alt_engine.get_news_bundle_structured(code_std)
+            except Exception as e:  # noqa: BLE001
+                err = build_error("alternative", "exception", str(e))
+                errors = [err]
+        else:
+            errors = [build_error("alternative", "missing", "情报引擎未初始化")]
+
+        # 保底：使用本地聚合，字段保持一致
         bundle: Dict[str, Any] = {
             "announcements": [],
             "reports": [],
@@ -1226,44 +1236,25 @@ class DataEngine:
             "forums": [],
             "opinions": [],
         }
-        errors: List[Dict[str, str]] = []
         sources: Dict[str, str] = {}
-        fallback_used = False
+        fallback_used = True
 
         ann = self.get_announcements_structured(code_std, limit=limit)
         bundle["announcements"] = ann.data if isinstance(ann.data, list) else []
         sources["announcements"] = ann.source
         errors.extend(ann.errors)
-        fallback_used = fallback_used or ann.fallback_used
 
         rep = self.get_research_reports_structured(code_std, limit=limit)
         bundle["reports"] = rep.data if isinstance(rep.data, list) else []
         sources["reports"] = rep.source
         errors.extend(rep.errors)
-        fallback_used = fallback_used or rep.fallback_used
 
         hot = self.get_hot_topics_structured(limit=limit)
         bundle["hot_events"] = hot.data if isinstance(hot.data, list) else []
         sources["hot_events"] = hot.source
         errors.extend(hot.errors)
-        fallback_used = fallback_used or hot.fallback_used
 
-        if self.alt_engine:
-            senti = self.alt_engine.fetch_guba_sentiment(symbol=code_std, limit=limit)
-            forums = senti.data if isinstance(senti.data, dict) else {}
-            bundle["forums"] = forums.get("sample_posts", []) if isinstance(forums, dict) else []
-            bundle["opinions"] = forums.get("hot_words", []) if isinstance(forums, dict) else []
-            sources["forums"] = senti.source
-            errors.extend(senti.errors)
-            fallback_used = fallback_used or senti.fallback_used
-        else:
-            errors.append(build_error("alternative", "missing", "情报引擎未初始化"))
-
-        coverage = sum(1 for k in ["announcements", "reports", "hot_events", "forums"] if bundle.get(k))
-        if coverage < 2:
-            fallback_used = True
-            errors.append(build_error("news_bundle", "sparse", "有效情报少于2类"))
-
+        coverage = sum(1 for k in ["announcements", "reports", "hot_events"] if bundle.get(k))
         meta = {"sources": sources, "filled_sections": coverage, "retrieved_at": _now_str()}
         return make_result(bundle, source="news_bundle", errors=errors, fallback_used=fallback_used, meta=meta)
 

@@ -14,6 +14,8 @@ HEADERS = {
 
 
 def _request_json(url: str, timeout: int = 10, retries: int = 1) -> Dict[str, Any]:
+    """Best-effort JSON fetcher that never raises."""
+
     last_exc: Exception | None = None
     for attempt in range(max(1, retries + 1)):
         try:
@@ -24,9 +26,7 @@ def _request_json(url: str, timeout: int = 10, retries: int = 1) -> Dict[str, An
             last_exc = exc
             if attempt < retries:
                 time.sleep(0.3 * (attempt + 1))
-    if last_exc:
-        raise last_exc
-    return {}
+    return {"_error": str(last_exc) if last_exc else "unknown error"}
 
 
 def _standardize_code(code: str) -> str:
@@ -44,8 +44,9 @@ def _standardize_code(code: str) -> str:
     return f"{code}.{market}"
 
 
-def fetch_research_reports_em(code: str, limit: int = 20, timeout: int = 10) -> List[Dict[str, Any]]:
-    """调用东财研报列表。"""
+def fetch_research_reports_em(code: str, limit: int = 20, timeout: int = 10) -> Dict[str, Any]:
+    """调用东财研报列表并返回错误信息。"""
+
     std = _standardize_code(code)
     plain = std.split(".")[0]
     url = (
@@ -54,7 +55,13 @@ def fetch_research_reports_em(code: str, limit: int = 20, timeout: int = 10) -> 
     )
     payload = _request_json(url, timeout=timeout)
     items = payload.get("data", []) if isinstance(payload, dict) else []
+    errors: List[Dict[str, str]] = []
     out: List[Dict[str, Any]] = []
+    if isinstance(payload, dict) and payload.get("_error"):
+        errors.append({"source": "report_eastmoney", "error_type": "exception", "message": str(payload.get("_error"))})
+    if not isinstance(items, list):
+        errors.append({"source": "report_eastmoney", "error_type": "invalid", "message": "unexpected payload"})
+        items = []
     for it in items:
         out.append(
             {
@@ -65,20 +72,26 @@ def fetch_research_reports_em(code: str, limit: int = 20, timeout: int = 10) -> 
                 "url": f"https://data.eastmoney.com/report/{it.get('infoCode','')}.html",
             }
         )
-    return out
+    if not out and not errors:
+        errors.append({"source": "report_eastmoney", "error_type": "empty", "message": "no reports"})
+    return {"items": out, "errors": errors}
 
 
-def fetch_research_reports_alt(code: str, limit: int = 15, timeout: int = 10) -> List[Dict[str, Any]]:
-    """同花顺/备选接口兜底。"""
+def fetch_research_reports_alt(code: str, limit: int = 15, timeout: int = 10) -> Dict[str, Any]:
+    """同花顺/备选接口兜底，返回结果及错误。"""
+
     std = _standardize_code(code)
     plain = std.split(".")[0]
     url = f"https://emdata.eastmoney.com/stock/research/{plain}.json"
-    try:
-        payload = _request_json(url, timeout=timeout)
-    except Exception:
-        return []
+    payload = _request_json(url, timeout=timeout)
     data = payload.get("data", []) if isinstance(payload, dict) else []
+    errors: List[Dict[str, str]] = []
     out: List[Dict[str, Any]] = []
+    if isinstance(payload, dict) and payload.get("_error"):
+        errors.append({"source": "report_eastmoney_alt", "error_type": "exception", "message": str(payload.get("_error"))})
+    if not isinstance(data, list):
+        errors.append({"source": "report_eastmoney_alt", "error_type": "invalid", "message": "unexpected payload"})
+        data = []
     for row in data[:limit]:
         out.append(
             {
@@ -89,7 +102,9 @@ def fetch_research_reports_alt(code: str, limit: int = 15, timeout: int = 10) ->
                 "url": row.get("url", ""),
             }
         )
-    return out
+    if not out and not errors:
+        errors.append({"source": "report_eastmoney_alt", "error_type": "empty", "message": "no reports"})
+    return {"items": out, "errors": errors}
 
 
 def sample_reports(code: str, limit: int = 10) -> List[Dict[str, Any]]:

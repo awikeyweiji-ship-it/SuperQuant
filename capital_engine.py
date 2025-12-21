@@ -8,8 +8,10 @@ Step5: Capital/flow intelligence (optional)
 from __future__ import annotations
 
 import re
+import inspect
+import time
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from logging_utils import get_data_logger, make_result, build_error, FetchResult
 from data_sources.capital_eastmoney import (
@@ -57,17 +59,40 @@ class CapitalEngine:
             market = "BJ"
         return f"{code}.{market}"
 
-    def _try(self, fn_name: str, **kwargs):
+    def _resolve_kwargs(self, fn, code: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        """根据函数签名动态适配 symbol/stock/代码位置参数。"""
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+        kwargs: Dict[str, Any] = {}
+        if not params:
+            return kwargs, None
+        if any(p.name == "symbol" for p in params):
+            kwargs["symbol"] = code
+        elif any(p.name == "stock" for p in params):
+            kwargs["stock"] = code
+        elif params and params[0].kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            # 位置参数调用
+            return {"__positional__": code}, None
+        else:
+            return {}, "no_compatible_params"
+        return kwargs, None
+
+    def _call_ak(self, fn_name: str, code: str) -> Tuple[Any, Optional[str]]:
         if ak is None:
-            return None
+            return None, "akshare_missing"
         fn = getattr(ak, fn_name, None)
         if not callable(fn):
-            return None
+            return None, "missing_fn"
+        kwargs, err = self._resolve_kwargs(fn, code)
+        if err:
+            return None, err
         try:
-            return fn(**kwargs)
-        except Exception as e:
+            if "__positional__" in kwargs:
+                return fn(kwargs["__positional__"]), None
+            return fn(**kwargs), None
+        except Exception as e:  # noqa: BLE001
             self.logger.warning("AkShare 资金接口 %s 异常: %s", fn_name, e)
-            return None
+            return None, str(e)
 
     def _fetch_capital_akshare(self, code: str, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
         for fn in (
@@ -75,7 +100,10 @@ class CapitalEngine:
             "stock_individual_fund_flow_em",
             "stock_individual_fund_flow_rank",
         ):
-            df = self._try(fn, symbol=code) or self._try(fn, stock=code)
+            df, err = self._call_ak(fn, code)
+            if err:
+                errors.append(build_error(fn, "exception", err))
+                continue
             if df is None or getattr(df, "empty", True):
                 continue
             try:
@@ -106,13 +134,16 @@ class CapitalEngine:
             errors.append(build_error("eastmoney", "exception", str(e)))
         return None
 
-    def _fetch_northbound(self, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    def _fetch_northbound(self, errors: List[Dict[str, str]], code: str = "") -> Optional[Dict[str, Any]]:
         if ak is not None:
             for fn in (
                 "stock_hsgt_fund_flow_summary_em",
                 "stock_hsgt_fund_flow_summary",
             ):
-                df = self._try(fn)
+                df, err = self._call_ak(fn, code)
+                if err:
+                    errors.append(build_error(fn, "exception", err))
+                    continue
                 if df is None or getattr(df, "empty", True):
                     continue
                 try:
@@ -135,7 +166,10 @@ class CapitalEngine:
     def _fetch_margin(self, code: str, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
         if ak is not None:
             for fn in ("stock_margin_sse", "stock_margin_detail_szse"):
-                df = self._try(fn)
+                df, err = self._call_ak(fn, code)
+                if err:
+                    errors.append(build_error(fn, "exception", err))
+                    continue
                 if df is None or getattr(df, "empty", True):
                     continue
                 try:
@@ -222,7 +256,7 @@ class CapitalEngine:
                 fallback_used = True
 
         # 3) 北向市场级
-        nb = self._fetch_northbound(errors)
+        nb = self._fetch_northbound(errors, code_std)
         if nb:
             out.update({k: v for k, v in nb.items() if v is not None})
             if source:
@@ -248,8 +282,29 @@ class CapitalEngine:
 
         if not out:
             errors.append(build_error("capital", "empty", "资金数据为空"))
+        required_fields = [
+            "main_net_inflow",
+            "super_large_net_inflow",
+            "large_net_inflow",
+            "medium_net_inflow",
+            "small_net_inflow",
+            "northbound_net_inflow",
+        ]
+        filled_metrics = sum(1 for k in required_fields if out.get(k) not in (None, "", "--"))
+        meta = {
+            "filled_metrics": filled_metrics,
+            "retrieved_at": time.time(),
+            "unit": "元",
+            "source_detail": out.get("source_detail"),
+        }
 
-        return make_result(out, source=source or "capital_flow", errors=errors, fallback_used=fallback_used or bool(errors))
+        return make_result(
+            out,
+            source=source or "capital_flow",
+            errors=errors,
+            fallback_used=fallback_used or bool(errors),
+            meta=meta,
+        )
 
     def get_capital_features(self, code: str) -> Dict[str, Any]:
         return self.get_capital_features_structured(code).data

@@ -389,6 +389,14 @@ class AlternativeDataEngine:
             "opinions": [],
         }
 
+        def _append_if_valid(category: str, item: Dict[str, Any]):
+            url = item.get("url")
+            t = item.get("time") or item.get("date")
+            if not url or not t:
+                errors.append(build_error(category, "invalid", f"{category} 缺少 url/time 被过滤"))
+                return
+            bundle[category].append(item)
+
         ann = self.fetch_announcements(symbol)
         rep = self.fetch_research_reports(symbol)
         hot = self.fetch_hot_topics(limit=8)
@@ -401,38 +409,41 @@ class AlternativeDataEngine:
 
         # 公告
         for item in (ann.data or []):
-            bundle["announcements"].append(
+            _append_if_valid(
+                "announcements",
                 self._news_item(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     source=f"announcement_{ann.source or 'unknown'}",
                     time_str=str(item.get("date") or item.get("time") or ""),
                     summary=item.get("type") or item.get("title", ""),
-                )
+                ),
             )
 
         # 研报
         for item in (rep.data or []):
-            bundle["reports"].append(
+            _append_if_valid(
+                "reports",
                 self._news_item(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     source=f"report_{rep.source or 'unknown'}",
                     time_str=str(item.get("date") or ""),
                     summary=f"{item.get('org','')} {item.get('rating','')}".strip(),
-                )
+                ),
             )
 
         # 热点/要事
         for item in (hot.data or []):
-            bundle["hot_events"].append(
+            _append_if_valid(
+                "hot_events",
                 self._news_item(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     source=f"hot_{hot.source or 'unknown'}",
                     time_str=str(item.get("time") or item.get("date") or ""),
                     summary=item.get("reason") or item.get("desc") or item.get("title", ""),
-                )
+                ),
             )
 
         # 论坛帖子
@@ -440,7 +451,8 @@ class AlternativeDataEngine:
         if isinstance(senti.data, dict):
             senti_posts = senti.data.get("sample_posts") or []
         for item in senti_posts:
-            bundle["forums"].append(
+            _append_if_valid(
+                "forums",
                 self._news_item(
                     title=item.get("summary", ""),
                     url=item.get("url", ""),
@@ -448,20 +460,21 @@ class AlternativeDataEngine:
                     time_str=str(item.get("time") or ""),
                     summary=item.get("summary", "")[:140],
                     raw_excerpt=item.get("summary", ""),
-                )
+                ),
             )
 
         # 舆情观点/公司新闻
         smart_data = smart_news.data if isinstance(smart_news.data, dict) else {}
         for item in smart_data.get("corporate", []) + smart_data.get("macro", []):
-            bundle["opinions"].append(
+            _append_if_valid(
+                "opinions",
                 self._news_item(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     source=f"smart_news_{smart_news.source or 'unknown'}",
                     time_str=str(item.get("date") or item.get("time") or ""),
                     summary=item.get("tag") or item.get("title", ""),
-                )
+                ),
             )
 
         # 统计 meta

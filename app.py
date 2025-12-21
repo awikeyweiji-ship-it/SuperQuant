@@ -236,16 +236,33 @@ def _safe_holistic(engine, code: str):
     return pack
 
 
+def _as_dict(val: dict | None) -> dict:
+    return val if isinstance(val, dict) else {}
+
+
+def _errors_count(errs) -> int:
+    if isinstance(errs, list):
+        return len(errs)
+    return 0
+
+
+def _filled_from_meta(meta_obj: dict | None):
+    inner = _as_dict(_as_dict(meta_obj).get("meta"))
+    return inner.get("filled_metrics") or inner.get("count")
+
+
 def _render_meta(meta: dict | None):
-    meta = meta or {}
+    meta = _as_dict(meta)
     src = meta.get("source", "-")
     fb = "是" if meta.get("fallback_used") else "否"
     cache = "命中" if meta.get("cache_hit") else "未命中"
     ts_str = _fmt_ts(meta.get("ts"))
-    filled = None
-    inner_meta = meta.get("meta", {}) if isinstance(meta.get("meta"), dict) else {}
-    filled = inner_meta.get("filled_metrics") or inner_meta.get("count")
-    st.caption(f"来源: {src} | fallback: {fb} | 缓存: {cache} | 时间: {ts_str} | 覆盖: {filled if filled is not None else '—'}")
+    filled = _filled_from_meta(meta)
+    st.caption(
+        "来源: {} | fallback: {} | 缓存: {} | 时间: {} | 覆盖: {}".format(
+            src, fb, cache, ts_str, filled if filled is not None else "—",
+        )
+    )
 
 
 def _minmax_norm(s: pd.Series) -> pd.Series:
@@ -562,14 +579,14 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         rep = st.session_state['report']
         dp = st.session_state['dp']
         news_bundle = dp.get("news_bundle") if isinstance(dp, dict) else {}
-        meta_map = dp.get("_meta", {}) if isinstance(dp, dict) else {}
-        quote_meta = meta_map.get("quote") or {}
-        identity_meta = meta_map.get("identity") or {}
-        kline_meta = meta_map.get("kline") or {}
-        fin_meta = meta_map.get("financial") or {}
-        money_meta = meta_map.get("money_flow") or {}
-        alt_meta = meta_map.get("alternative") or {}
-        news_meta = meta_map.get("news_bundle") or {}
+        meta_map = _as_dict(_as_dict(dp).get("_meta"))
+        quote_meta = _as_dict(meta_map.get("quote"))
+        identity_meta = _as_dict(meta_map.get("identity"))
+        kline_meta = _as_dict(meta_map.get("kline"))
+        fin_meta = _as_dict(meta_map.get("financial"))
+        money_meta = _as_dict(meta_map.get("money_flow"))
+        alt_meta = _as_dict(meta_map.get("alternative"))
+        news_meta = _as_dict(meta_map.get("news_bundle"))
 
         # 1. 核心决策头 (Header)
         st.markdown("---")
@@ -578,7 +595,8 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         st.markdown(f"### {id_name} ({dp.get('code')}) | <span class='tag-concept'>{sector}</span>", unsafe_allow_html=True)
 
         c_h1, c_h2, c_h3, c_h4 = st.columns(4)
-        md = dp.get('market_data') or {}
+        dp = _as_dict(dp)
+        md = _as_dict(dp.get('market_data'))
         c_h1.metric("现价", _fmt_val(md.get('close') or md.get('price')), _fmt_val(md.get('pct') or md.get('pct_chg'), suffix="%"))
         c_h2.metric("AI 综合评分", _fmt_val(rep.get('ai_score')))
         
@@ -601,18 +619,16 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 ("alternative", "情报", alt_meta),
                 ("news_bundle", "情报流", news_meta),
             ]:
-                meta = meta or {}
-                raw_meta = meta.get("meta") if isinstance(meta, dict) else {}
-                meta_meta = raw_meta if isinstance(raw_meta, dict) else {}
+                safe_meta = _as_dict(meta)
                 diag_rows.append({
                     "模块": label,
-                    "ok": meta.get("ok"),
-                    "source": meta.get("source"),
-                    "fallback": meta.get("fallback_used"),
-                    "cache_hit": meta.get("cache_hit"),
-                    "ts": _fmt_ts(meta.get("ts")),
-                    "filled": meta_meta.get("filled_metrics") or meta_meta.get("count"),
-                    "errors": len(meta.get("errors") or []),
+                    "ok": safe_meta.get("ok"),
+                    "source": safe_meta.get("source") or "—",
+                    "fallback": safe_meta.get("fallback_used") or False,
+                    "cache_hit": safe_meta.get("cache_hit") or False,
+                    "ts": _fmt_ts(safe_meta.get("ts")),
+                    "filled": _filled_from_meta(safe_meta) or "—",
+                    "errors": _errors_count(safe_meta.get("errors")),
                 })
             if diag_rows:
                 st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)

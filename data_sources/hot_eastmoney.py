@@ -26,6 +26,10 @@ def fetch_hot_topics_em(limit: int = 10, timeout: int = 10) -> List[Dict[str, An
                 "heat": it.get("f62"),
                 "top_stock": it.get("f128") or it.get("f12"),
                 "tag": "东财概念热度",
+                "title": it.get("f14", ""),
+                "time": time.strftime("%Y-%m-%d"),
+                "url": f"https://quote.eastmoney.com/center/boardlist.html#concept_board/{it.get('f12','')}",
+                "reason": "概念热度榜",
             }
         )
     return out
@@ -50,6 +54,10 @@ def fetch_hot_topics_ak(limit: int = 10) -> List[Dict[str, Any]]:
                 "heat": row.get("个股人气", ""),
                 "top_stock": row.get("代码", ""),
                 "tag": "AkShare热榜",
+                "title": row.get("名称", ""),
+                "time": time.strftime("%Y-%m-%d"),
+                "url": "https://www.eastmoney.com/",
+                "reason": "人气榜",
             }
         )
     return out
@@ -63,6 +71,10 @@ def sample_hot_topics(limit: int = 5) -> List[Dict[str, Any]]:
             "heat": 9999,
             "top_stock": "示例股",
             "tag": f"离线样本 {ts}",
+            "title": "【样本】低空经济",
+            "time": time.strftime("%Y-%m-%d"),
+            "url": "https://example.com/hot",
+            "reason": "离线热点样本",
         }
         for _ in range(limit)
     ]

@@ -31,7 +31,7 @@ def canonical_identity(raw_code: str) -> Identity:
         code = code.zfill(6)
     # infer exchange
     exch = "SZ"
-    if code.startswith(("6", "9", "5")):
+    if code.startswith(("6", "68", "50", "11", "9", "5")):
         exch = "SH"
     elif code.startswith(("8", "4")):
         exch = "BJ"

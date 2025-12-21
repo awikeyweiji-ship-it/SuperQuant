@@ -73,24 +73,26 @@ def _pd_error_message() -> Optional[str]:
 
 def _safe_dataframe(df, **kwargs):
     """Render dataframe defensively to avoid Arrow conversion crashes."""
-    try:
-        return st.dataframe(df, **kwargs)
-    except Exception:
-        pd = _get_pandas()
+    pd = _get_pandas()
+    def _sanitize(frame):
         if pd is None:
-            try:
-                return st.dataframe(df, **kwargs)
-            except Exception:
-                return st.dataframe([], **kwargs)
+            return frame
+        tmp = pd.DataFrame(frame).copy()
+        for col in tmp.columns:
+            if str(tmp[col].dtype) == "object":
+                tmp[col] = tmp[col].replace({"—": None, "--": None, "": None}).astype(str)
+            else:
+                tmp[col] = pd.to_numeric(tmp[col], errors="ignore")
+        return tmp
+
+    try:
+        return st.dataframe(_sanitize(df) if pd is not None else df, **kwargs)
+    except Exception:
         try:
-            safe_df = df.copy()
-            for col in safe_df.columns:
-                if str(safe_df[col].dtype) == "object":
-                    safe_df[col] = safe_df[col].astype(str)
-            return st.dataframe(safe_df, **kwargs)
+            return st.dataframe(_sanitize(df) if pd is not None else df, **kwargs)
         except Exception:
             try:
-                return st.dataframe(pd.DataFrame(df).astype(str), **kwargs)
+                return st.dataframe(pd.DataFrame(df).astype(str) if pd is not None else [], **kwargs)
             except Exception:
                 return st.dataframe([], **kwargs)
 

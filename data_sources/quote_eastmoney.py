@@ -1,34 +1,17 @@
 """Eastmoney quote provider for real-time snapshot fields."""
 from __future__ import annotations
 
-import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import requests
+
+from data_sources.identity import canonical_identity
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Referer": "https://quote.eastmoney.com/",
 }
-
-
-def _standardize(code: str) -> str:
-    code = str(code).strip()
-    code = re.sub(r"\.(SH|SZ|BJ|sh|sz|bj)$", "", code)
-    if code.isdigit() and len(code) < 6:
-        code = code.zfill(6)
-    market = "SZ"
-    if code.startswith("6"):
-        market = "SH"
-    elif code.startswith(("8", "4")):
-        market = "BJ"
-    return f"{code}.{market}"
-
-
-def _to_secid(code_std: str) -> str:
-    plain, market = code_std.split(".")
-    return ("1" if market == "SH" else "0") + f".{plain}"
 
 
 def _to_float(val: Any, scale: float = 1.0) -> Optional[float]:
@@ -37,7 +20,10 @@ def _to_float(val: Any, scale: float = 1.0) -> Optional[float]:
     try:
         return float(val) / scale
     except Exception:
-        return None
+        try:
+            return float(str(val).replace("%", "")) / scale
+        except Exception:
+            return None
 
 
 def _count(data: Dict[str, Any]) -> int:
@@ -45,42 +31,46 @@ def _count(data: Dict[str, Any]) -> int:
 
 
 def fetch(symbol: str, timeout: float = 6.0, retries: int = 1, **_: Any) -> Dict[str, Any]:
-    code_std = _standardize(symbol)
-    secid = _to_secid(code_std)
+    ident = canonical_identity(symbol)
     meta = {
         "source": "quote_eastmoney",
         "retrieved_at": time.time(),
         "errors": [],
         "fallback_used": False,
         "cache_hit": False,
+        "used_key": ident.secid,
         "filled_metrics": 0,
     }
 
     url = "https://push2.eastmoney.com/api/qt/stock/get"
     params = {
-        "secid": secid,
-        "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f170,f71,f84,f162,f167,f116,f117",
+        "secid": ident.secid,
+        "fields": "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f57,f58,f59,f60,f116,f117,f168,f170,f171,f172,f173,f84",
     }
 
     last_exc: Optional[Exception] = None
     for attempt in range(max(1, retries + 1)):
         try:
-            resp = requests.get(
-                url,
-                params=params,
-                timeout=timeout,
-                headers=HEADERS,
-            )
+            resp = requests.get(url, params=params, timeout=timeout, headers=HEADERS)
+            meta.setdefault("status_code", resp.status_code)
             resp.raise_for_status()
-            data = (resp.json() or {}).get("data") or {}
-            if not data:
-                meta["errors"].append({"source": meta["source"], "error_type": "empty", "message": "no data"})
+            payload = resp.json() or {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                meta["errors"].append(
+                    {
+                        "source": meta["source"],
+                        "error_type": "invalid",
+                        "message": "payload data not dict",
+                        "response_snippet": str(payload)[:200],
+                    }
+                )
                 continue
 
             vol_raw = _to_float(data.get("f47"))
             amount_raw = _to_float(data.get("f48"))
-            payload = {
-                "code": code_std,
+            payload_data = {
+                "code": ident.symbol,
                 "name": data.get("f58", ""),
                 "price": _to_float(data.get("f43"), scale=100),
                 "open": _to_float(data.get("f46"), scale=100),
@@ -92,9 +82,9 @@ def fetch(symbol: str, timeout: float = 6.0, retries: int = 1, **_: Any) -> Dict
                 "amount": amount_raw,
                 "turnover": _to_float(data.get("f84"), scale=100),
             }
-            meta["filled_metrics"] = _count(payload)
+            meta["filled_metrics"] = _count(payload_data)
             meta["errors_count"] = len(meta["errors"])
-            return {"data": payload, "meta": meta}
+            return {"data": payload_data, "meta": meta}
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             meta["errors"].append(
@@ -102,10 +92,12 @@ def fetch(symbol: str, timeout: float = 6.0, retries: int = 1, **_: Any) -> Dict
                     "source": meta["source"],
                     "error_type": "exception",
                     "message": str(exc),
+                    "url": url,
+                    "used_key": ident.secid,
                 }
             )
             if attempt < retries:
-                time.sleep(0.3 * (attempt + 1))
+                time.sleep(0.5 * (attempt + 1))
 
     meta["errors_count"] = len(meta["errors"])
     if last_exc:

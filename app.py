@@ -12,6 +12,7 @@ app.py
 
 import os
 import re
+from datetime import datetime
 from config_manager import get_config, update_keys, test_deepseek, test_tavily
 import pandas as pd
 import numpy as np
@@ -29,6 +30,7 @@ from signal_fuser import SignalFuser
 from slow_factor_engine import SlowFactorEngine
 from paper_portfolio import simulate_paper_portfolio
 import ai_advisor
+from logging_utils import FetchResult, build_error, make_result
 
 # Step4: backtest + weight learning (optional)
 try:
@@ -139,15 +141,90 @@ mode = st.sidebar.radio("作战模式",
 # 2.5 兼容工具函数
 # ==========================================
 
+def _fmt_ts(ts_val: float) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts_val)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "-"
+
+
+def _render_errors(errors):
+    if not errors:
+        st.caption("无错误")
+        return
+    for err in errors:
+        src = err.get("source", "?")
+        typ = err.get("error_type", "?")
+        msg = err.get("message", "")
+        st.error(f"来源: {src} | 类型: {typ} | 详情: {msg}")
+
+
+def _safe_fetch(fn, label: str) -> FetchResult:
+    try:
+        res = fn()
+        if isinstance(res, FetchResult):
+            return res
+        if hasattr(res, "ok") and hasattr(res, "errors"):
+            return res  # type: ignore[return-value]
+        return make_result({}, source=label, errors=[build_error(label, "invalid", "返回结构非 FetchResult")])
+    except Exception as e:  # noqa: BLE001
+        return make_result({}, source=label, fallback_used=True, errors=[build_error(label, "exception", str(e))])
+
+
 def _safe_holistic(engine, code: str):
-    """Compatibility wrapper for holistic data API across versions."""
-    if hasattr(engine, "get_holistic_data"):
-        return engine.get_holistic_data(code)
-    if hasattr(engine, "get_holistic_pack"):
-        return engine.get_holistic_pack(code)
-    if hasattr(engine, "get_holistic"):
-        return engine.get_holistic(code)
-    raise AttributeError("DataEngine has no holistic data method")
+    code_std = normalize_code(code)
+    # 结构化调用，保证 source/fallback/errors 可见
+    spot = _safe_fetch(lambda: engine.get_spot_row_structured(code_std), "quote")
+    identity = _safe_fetch(lambda: engine.get_stock_identity_structured(code_std), "identity")
+    kline = _safe_fetch(lambda: engine.get_kline_structured(code_std, freq="daily", limit=120), "kline")
+    fin = _safe_fetch(lambda: engine.get_financial_features_structured(code_std), "financial")
+    money = _safe_fetch(lambda: engine.get_money_flow_structured(code_std), "money_flow")
+
+    if getattr(engine, "alt_engine", None) is not None:
+        alt = _safe_fetch(lambda: engine.alt_engine.get_alternative_report_structured(code_std, sector=identity.data.get("sector", "")), "alternative")
+    else:
+        alt = make_result({}, source="alternative", fallback_used=True, errors=[build_error("alternative", "missing", "另类数据引擎未初始化")])
+
+    tech_brief = "无数据"
+    if hasattr(kline.data, "empty") and not kline.data.empty:
+        try:
+            last = kline.data.iloc[-1]
+            tech_brief = f"最新价: {last['close']} | 涨跌: {last['close'] - last['open']:.2f}"
+        except Exception:
+            tech_brief = "K线解析异常"
+
+    pack = {
+        "code": code_std,
+        "timestamp": _fmt_ts(datetime.now().timestamp()),
+        "identity": identity.data,
+        "market_data": spot.data,
+        "financials": fin.data,
+        "money_flow": money.data,
+        "technical_brief": tech_brief,
+        "alternative_intelligence": alt.data,
+        "macro_context": alt.data.get("macro_environment", {}) if isinstance(alt.data, dict) else {},
+        "corporate_news": alt.data.get("corporate_news", []) if isinstance(alt.data, dict) else [],
+        "macro_news": alt.data.get("macro_news", []) if isinstance(alt.data, dict) else [],
+        "kline": kline.data,
+    }
+
+    pack["_meta"] = {
+        "quote": spot.to_dict(),
+        "identity": identity.to_dict(),
+        "kline": kline.to_dict(),
+        "financial": fin.to_dict(),
+        "money_flow": money.to_dict(),
+        "alternative": alt.to_dict(),
+    }
+    return pack
+
+
+def _render_meta(meta: dict):
+    src = meta.get("source", "-")
+    fb = "是" if meta.get("fallback_used") else "否"
+    cache = "命中" if meta.get("cache_hit") else "未命中"
+    ts_str = _fmt_ts(meta.get("ts"))
+    st.caption(f"来源: {src} | fallback: {fb} | 缓存: {cache} | 时间: {ts_str}")
 
 
 def _minmax_norm(s: pd.Series) -> pd.Series:
@@ -463,26 +540,83 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
     if 'report' in st.session_state:
         rep = st.session_state['report']
         dp = st.session_state['dp']
-        
+        meta_map = dp.get("_meta", {}) if isinstance(dp, dict) else {}
+        quote_meta = meta_map.get("quote", {})
+        identity_meta = meta_map.get("identity", {})
+        kline_meta = meta_map.get("kline", {})
+        fin_meta = meta_map.get("financial", {})
+        money_meta = meta_map.get("money_flow", {})
+        alt_meta = meta_map.get("alternative", {})
+
         # 1. 核心决策头 (Header)
         st.markdown("---")
-        st.markdown(f"### {dp['identity']['name']} ({dp['code']}) | <span class='tag-concept'>{dp['identity']['sector']}</span>", unsafe_allow_html=True)
-        
+        id_name = (dp.get('identity') or {}).get('name') or dp.get('code')
+        sector = (dp.get('identity') or {}).get('sector', '') or '-'
+        st.markdown(f"### {id_name} ({dp.get('code')}) | <span class='tag-concept'>{sector}</span>", unsafe_allow_html=True)
+
         c_h1, c_h2, c_h3, c_h4 = st.columns(4)
-        c_h1.metric("现价", dp['market_data'].get('close'), f"{dp['market_data'].get('pct')}%")
+        md = dp.get('market_data') or {}
+        c_h1.metric("现价", md.get('close') or md.get('price'), f"{md.get('pct') or md.get('pct_chg')}%")
         c_h2.metric("AI 综合评分", rep.get('ai_score'))
         
         # 决策高亮
         decision = rep.get('decision', '观望')
         color_cls = "decision-buy" if "买" in decision or "潜伏" in decision else "decision-sell" if "卖" in decision or "清" in decision else ""
         c_h3.markdown(f"**决策: <span class='{color_cls}'>{decision}</span>**", unsafe_allow_html=True)
-        c_h4.metric("市值", f"{dp['market_data'].get('market_cap')}亿")
+        mc_val = md.get('market_cap')
+        mc_display = "-" if mc_val in (None, "", 0) else f"{mc_val}亿"
+        c_h4.metric("市值", mc_display)
+
+        with st.expander("🩺 数据链路诊断"):
+            diag_rows = []
+            for key, label, meta in [
+                ("quote", "行情", quote_meta),
+                ("identity", "身份", identity_meta),
+                ("kline", "K线", kline_meta),
+                ("financial", "财务", fin_meta),
+                ("money_flow", "资金", money_meta),
+                ("alternative", "情报", alt_meta),
+            ]:
+                diag_rows.append({
+                    "模块": label,
+                    "ok": meta.get("ok"),
+                    "source": meta.get("source"),
+                    "fallback": meta.get("fallback_used"),
+                    "cache_hit": meta.get("cache_hit"),
+                    "ts": _fmt_ts(meta.get("ts")),
+                    "errors": len(meta.get("errors", [])),
+                })
+            if diag_rows:
+                st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+            for label, meta in [("行情", quote_meta), ("身份", identity_meta), ("K线", kline_meta), ("财务", fin_meta), ("资金", money_meta), ("情报", alt_meta)]:
+                if meta.get("errors"):
+                    st.markdown(f"**{label}错误详情:**")
+                    _render_errors(meta.get("errors"))
 
         # 2. 分页展示 (Tabs)
         tab_dash, tab_kline, tab_logic, tab_fund = st.tabs(["📊 战术看板", "📈 K线图表", "🧠 逻辑拆解", "💰 财务/资金"])
 
         # --- Tab 1: 战术看板 (Dashboard) ---
         with tab_dash:
+            st.markdown("#### 行情/身份概览")
+            col_q, col_id = st.columns(2)
+            with col_q:
+                price = md.get('close') or md.get('price')
+                pct = md.get('pct') or md.get('pct_chg')
+                st.metric("现价", price if price is not None else "-", f"{pct}%" if pct is not None else None)
+                st.write(f"成交额: {md.get('amount') or '-'} | 量比: {md.get('vol_ratio') or '-'}")
+                _render_meta(quote_meta)
+                if not quote_meta.get("ok"):
+                    _render_errors(quote_meta.get("errors"))
+            with col_id:
+                st.write(f"行业: {sector or '-'}")
+                concepts = (dp.get('identity') or {}).get('concepts') or []
+                st.write("概念: " + ("，".join(concepts) if concepts else "-"))
+                _render_meta(identity_meta)
+                if not identity_meta.get("ok"):
+                    _render_errors(identity_meta.get("errors"))
+
+            st.markdown("---")
             # 1. 核心结论 (The Setup)
             st.markdown(f"<div class='logic-box'><b>⚡ 短线逻辑 (The Setup)</b><br>{rep.get('setup_logic')}</div>", unsafe_allow_html=True)
             
@@ -512,12 +646,15 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         with tab_kline:
             st.caption("支持滚轮缩放与拖拽")
             col_k1, col_k2, col_k3 = st.columns(3)
-            with col_k1: 
+            with col_k1:
                 plot_kline(dp['code'], 'daily', "日线 (Daily)")
-            with col_k2: 
+            with col_k2:
                 plot_kline(dp['code'], 'weekly', "周线 (Weekly)")
-            with col_k3: 
+            with col_k3:
                 plot_kline(dp['code'], 'monthly', "月线 (Monthly)")
+            _render_meta(kline_meta)
+            if not kline_meta.get("ok"):
+                _render_errors(kline_meta.get("errors"))
 
         # --- Tab 3: 深度逻辑 (Logic) ---
         with tab_logic:
@@ -534,11 +671,14 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             with c_l2:
                 st.markdown("#### 💸 资金与博弈 (Money & Game)")
                 st.warning(body.get('funds_sentiment', '无数据'))
-                
+
                 st.markdown("#### 🗣️ 舆情与情绪 (Sentiment)")
                 sent = dp['alternative_intelligence']
                 st.write(f"散户情绪分: {sent.get('retail_sentiment')}")
                 st.text(f"股吧样本: {sent.get('raw_guba_sample')}")
+                _render_meta(alt_meta)
+                if not alt_meta.get("ok"):
+                    _render_errors(alt_meta.get("errors"))
 
             st.divider()
             st.markdown("#### 原始情报参考")
@@ -548,17 +688,25 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
 
         # --- Tab 4: 财务与资金 (Fundamentals) ---
         with tab_fund:
-            fin = dp['financials']
+            fin = dp.get('financials') or {}
             c_f1, c_f2, c_f3, c_f4 = st.columns(4)
             c_f1.metric("ROE", f"{fin.get('roe')}%")
             c_f2.metric("毛利率", f"{fin.get('gross_margin')}%")
             c_f3.metric("利润增长", f"{fin.get('profit_yoy')}%")
             c_f4.metric("营收增长", f"{fin.get('revenue_yoy')}%")
-            
+            st.write(f"报告期: {fin.get('report_date')}")
+            _render_meta(fin_meta)
+            if not fin_meta.get("ok"):
+                _render_errors(fin_meta.get("errors"))
+
             st.markdown("---")
-            money = dp['money_flow']
+            money = dp.get('money_flow') or {}
             st.metric("今日主力净流入", f"{money.get('main_net_inflow_today')} 万")
-            st.caption("注：财务数据来自最新财报，资金数据来自实时行情接口")
+            st.write(f"北向: {money.get('north_money_net')} | 两融: {money.get('margin_balance_delta')}")
+            _render_meta(money_meta)
+            if not money_meta.get("ok"):
+                _render_errors(money_meta.get("errors"))
+            st.caption("注：财务/资金均展示来源与兜底信息，失败时可据 errors 快速定位。")
 
 
 # ------------------------------------------------------------------

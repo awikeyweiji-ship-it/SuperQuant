@@ -15,6 +15,18 @@ import requests
 import datetime
 from typing import Dict, Any, List
 
+from logging_utils import make_result, build_error, FetchResult
+from universe_cache import UniverseCache
+from data_sources.sentiment_eastmoney import (
+    fetch_guba_api,
+    fetch_guba_html,
+    fetch_xueqiu_search,
+    sample_sentiment,
+)
+from data_sources.announcement_eastmoney import fetch_announcements_em, fetch_announcements_tencent, sample_announcements
+from data_sources.report_eastmoney import fetch_research_reports_em, fetch_research_reports_alt, sample_reports
+from data_sources.hot_eastmoney import fetch_hot_topics_em, fetch_hot_topics_ak, sample_hot_topics
+
 try:
     import akshare as ak
 except ImportError:
@@ -56,9 +68,11 @@ TRASH_WORDS = {
 }
 
 class AlternativeDataEngine:
-    def __init__(self):
+    def __init__(self, cache: UniverseCache | None = None):
         print("🕵️ [情报局 V9.1] 启动 (天网情报系统已修复)...")
         self.macro_cache = {}
+        self.cache = cache or UniverseCache()
+        self.sentiment_ttl = 60 * 30
 
     def _calculate_sentiment(self, text: str) -> float:
         if not text or not jieba: return 0.0
@@ -74,12 +88,42 @@ class AlternativeDataEngine:
     # ------------------------------------------------------------------
     # A. 舆情监听 (Guba)
     # ------------------------------------------------------------------
-    def fetch_guba_sentiment(self, symbol: str) -> Dict[str, Any]:
-        """爬取股吧评论"""
-        try:
-            return self._crawl_guba_html(symbol)
-        except Exception:
-            return {"score": 0, "hot_words": [], "source": "failed", "sample_text": "获取失败"}
+    def fetch_guba_sentiment(self, symbol: str, limit: int = 20) -> FetchResult:
+        """股吧舆情：多源兜底 + 缓存，避免阻塞。"""
+        cache_key = self.cache.key("sentiment", {"symbol": symbol, "limit": limit})
+        cached = self.cache.get(cache_key, ttl=self.sentiment_ttl)
+        if cached is not None:
+            return make_result(cached, source=str(cached.get("source", "cache")), cache_hit=True)
+
+        providers = [
+            ("eastmoney_api", lambda: fetch_guba_api(symbol, limit=limit, timeout=10)),
+            ("eastmoney_html", lambda: fetch_guba_html(symbol, limit=limit, timeout=8)),
+            ("xueqiu", lambda: fetch_xueqiu_search(symbol, limit=limit, timeout=8)),
+        ]
+
+        errors: List[Dict[str, str]] = []
+        chosen: Dict[str, Any] | None = None
+        source = ""
+
+        for name, fn in providers:
+            try:
+                data = fn()
+            except Exception as e:  # noqa: BLE001
+                errors.append(build_error(name, "exception", str(e)))
+                continue
+            if data and data.get("sample_posts"):
+                chosen = data
+                source = name
+                break
+            errors.append(build_error(name, "empty", f"{name} 无有效帖子"))
+
+        if not chosen:
+            chosen = sample_sentiment(symbol)
+            source = "sample_cache"
+            errors.append(build_error("sample_cache", "fallback", "启用离线舆情样本，数据可能过期"))
+
+        self.cache.set(cache_key, chosen)
+        return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
 
     def _crawl_guba_html(self, symbol: str) -> Dict[str, Any]:
         url = f"http://guba.eastmoney.com/list,{symbol}.html"
@@ -125,7 +169,7 @@ class AlternativeDataEngine:
     # ------------------------------------------------------------------
     # B. 智能新闻抓取 (Smart News Waterfall)
     # ------------------------------------------------------------------
-    def fetch_smart_news(self, symbol: str, sector: str = "") -> Dict[str, List[Dict]]:
+    def fetch_smart_news(self, symbol: str, sector: str = "") -> FetchResult:
         """
         三级情报抓取。
         【修复点】: 增加了 sector 参数，防止调用报错。
@@ -134,7 +178,10 @@ class AlternativeDataEngine:
             "corporate": [],
             "macro": []
         }
-        if ak is None: return report
+        errors: List[Dict[str, str]] = []
+        if ak is None:
+            errors.append(build_error("akshare", "missing", "AkShare 未安装"))
+            return make_result(report, source="akshare", errors=errors)
 
         # 1. 第一级：个股新闻
         try:
@@ -149,7 +196,10 @@ class AlternativeDataEngine:
                             tag = "🔥资本运作"
                             break
                     report["corporate"].append({"title": title, "date": date, "tag": tag})
-        except: pass
+            else:
+                errors.append(build_error("akshare", "empty", "公司新闻为空"))
+        except Exception as e:
+            errors.append(build_error("akshare", "exception", str(e)))
 
         # 2. 第二级：宏观/政策新闻 (必抓)
         try:
@@ -163,9 +213,12 @@ class AlternativeDataEngine:
                         report["macro"].append({"title": title, "date": pub_time, "tag": "🏛️宏观政策"})
                         count += 1
                     if count >= 3: break
-        except: pass
+            else:
+                errors.append(build_error("akshare", "empty", "宏观新闻为空"))
+        except Exception as e:
+            errors.append(build_error("akshare", "exception", str(e)))
 
-        return report
+        return make_result(report, source="akshare", errors=errors, fallback_used=bool(errors))
 
     # ------------------------------------------------------------------
     # C. 真实宏观数据指标
@@ -219,33 +272,172 @@ class AlternativeDataEngine:
         return macro_data
 
     # ------------------------------------------------------------------
+    # D. 公告 / 研报 / 热点要事
+    # ------------------------------------------------------------------
+    def fetch_announcements(self, symbol: str, limit: int = 12) -> FetchResult:
+        errors: List[Dict[str, str]] = []
+        chosen: List[Dict[str, Any]] = []
+        source = ""
+        providers = [
+            ("eastmoney", lambda: fetch_announcements_em(symbol, limit=limit)),
+            ("tencent", lambda: fetch_announcements_tencent(symbol, limit=limit)),
+        ]
+
+        for name, fn in providers:
+            try:
+                data = fn()
+            except Exception as e:  # noqa: BLE001
+                errors.append(build_error(name, "exception", str(e)))
+                continue
+            if data:
+                chosen = data
+                source = name
+                break
+            errors.append(build_error(name, "empty", f"{name} 公告为空"))
+
+        if not chosen:
+            errors.append(build_error("sample", "fallback", "启用离线公告样本，数据可能过期"))
+            chosen = sample_announcements(symbol, limit=limit)
+            source = "sample_cache"
+
+        return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
+
+    def fetch_research_reports(self, symbol: str, limit: int = 12) -> FetchResult:
+        errors: List[Dict[str, str]] = []
+        chosen: List[Dict[str, Any]] = []
+        source = ""
+        providers = [
+            ("eastmoney", lambda: fetch_research_reports_em(symbol, limit=limit)),
+            ("alt", lambda: fetch_research_reports_alt(symbol, limit=limit)),
+        ]
+
+        for name, fn in providers:
+            try:
+                data = fn()
+            except Exception as e:  # noqa: BLE001
+                errors.append(build_error(name, "exception", str(e)))
+                continue
+            if data:
+                chosen = data
+                source = name
+                break
+            errors.append(build_error(name, "empty", f"{name} 研报为空"))
+
+        if not chosen:
+            errors.append(build_error("sample", "fallback", "启用离线研报样本，数据可能过期"))
+            chosen = sample_reports(symbol, limit=limit)
+            source = "sample_cache"
+
+        return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
+
+    def fetch_hot_topics(self, limit: int = 8) -> FetchResult:
+        errors: List[Dict[str, str]] = []
+        chosen: List[Dict[str, Any]] = []
+        source = ""
+        providers = [
+            ("eastmoney", lambda: fetch_hot_topics_em(limit=limit)),
+            ("akshare", lambda: fetch_hot_topics_ak(limit=limit)),
+        ]
+
+        for name, fn in providers:
+            try:
+                data = fn()
+            except Exception as e:  # noqa: BLE001
+                errors.append(build_error(name, "exception", str(e)))
+                continue
+            if data:
+                chosen = data
+                source = name
+                break
+            errors.append(build_error(name, "empty", f"{name} 热点为空"))
+
+        if not chosen:
+            errors.append(build_error("sample", "fallback", "启用离线热点样本，数据可能过期"))
+            chosen = sample_hot_topics(limit=limit)
+            source = "sample_cache"
+
+        return make_result(chosen, source=source, errors=errors, fallback_used=len(errors) > 0)
+
+    # ------------------------------------------------------------------
     # 主入口 (修复点：增加 sector 参数)
     # ------------------------------------------------------------------
     def get_alternative_report(self, symbol: str, sector: str = "") -> Dict[str, Any]:
+        return self.get_alternative_report_structured(symbol, sector).data
+
+    def get_alternative_report_structured(self, symbol: str, sector: str = "") -> FetchResult:
         """
         获取另类情报报告。
         :param symbol: 股票代码
         :param sector: 所属行业 (新增参数，用于行业补全)
         """
-        # 1. 舆情
+        errors: List[Dict[str, str]] = []
+
         guba = self.fetch_guba_sentiment(symbol)
-        # 2. 宏观
+        if not guba.ok:
+            errors.extend(guba.errors)
+
         macro = self.fetch_macro_indexes()
-        # 3. 智能新闻 (传入 sector)
         smart_news = self.fetch_smart_news(symbol, sector)
-        
-        alt_signal = "中性"
-        if guba['score'] > 0.3: alt_signal = "情绪贪婪"
-        elif guba['score'] < -0.3: alt_signal = "情绪恐慌"
-            
-        return {
-            "symbol": symbol,
-            "retail_sentiment": guba['score'], 
-            "hot_topics": guba['hot_words'],   
-            "macro_environment": macro,        
-            "alternative_signal": alt_signal,  
-            "raw_guba_sample": guba.get("sample_text", ""),
-            "corporate_news": smart_news["corporate"],
-            "macro_news": smart_news["macro"],
-            "data_source": guba.get("source", "unknown")
+        if not smart_news.ok:
+            errors.extend(smart_news.errors)
+
+        announcements = self.fetch_announcements(symbol)
+        if not announcements.ok:
+            errors.extend(announcements.errors)
+
+        reports = self.fetch_research_reports(symbol)
+        if not reports.ok:
+            errors.extend(reports.errors)
+
+        hot_topics = self.fetch_hot_topics(limit=8)
+        if not hot_topics.ok:
+            errors.extend(hot_topics.errors)
+
+        sentiment_data = guba.data if isinstance(guba.data, dict) else {}
+        sentiment_block = {
+            "sentiment_score": sentiment_data.get("sentiment_score") or sentiment_data.get("score", 0),
+            "hot_words": sentiment_data.get("hot_words", []),
+            "sample_posts": sentiment_data.get("sample_posts", []),
+            "source": guba.source,
+            "fallback_used": guba.fallback_used,
         }
+
+        data = {
+            "symbol": symbol,
+            "retail_sentiment": sentiment_block["sentiment_score"] or 0,
+            "hot_words": sentiment_block.get("hot_words", []),
+            "macro_environment": macro,
+            "alternative_signal": "中性",
+            "sentiment": sentiment_block,
+            "raw_guba_sample": sentiment_data.get("sample_text", ""),
+            "corporate_news": smart_news.data.get("corporate", []) if isinstance(smart_news.data, dict) else [],
+            "macro_news": smart_news.data.get("macro", []) if isinstance(smart_news.data, dict) else [],
+            "data_source": guba.data.get("source", "unknown") if isinstance(sentiment_data, dict) else "unknown",
+            "announcements": announcements.data if isinstance(announcements.data, list) else [],
+            "research_reports": reports.data if isinstance(reports.data, list) else [],
+            "hot_topics": hot_topics.data if isinstance(hot_topics.data, list) else [],
+            "ann_source": announcements.source,
+            "report_source": reports.source,
+            "hot_source": hot_topics.source,
+        }
+
+        score_val = data["retail_sentiment"]
+        if not sentiment_block.get("sample_posts"):
+            errors.append(build_error("sentiment", "empty", "舆情帖子为空（已尝试多源）"))
+
+        if score_val > 0.3:
+            data["alternative_signal"] = "情绪贪婪"
+        elif score_val < -0.3:
+            data["alternative_signal"] = "情绪恐慌"
+
+        if not data["corporate_news"]:
+            errors.append(build_error("akshare", "empty", "公司新闻缺失"))
+
+        if not data["announcements"]:
+            errors.append(build_error("announcement", "empty", "公告为空（已尝试多源）"))
+        if not data["research_reports"]:
+            errors.append(build_error("research", "empty", "研报为空（已尝试多源）"))
+        if not data["hot_topics"]:
+            errors.append(build_error("hot", "empty", "热点为空（已尝试多源）"))
+
+        return make_result(data, source="alternative_data", errors=errors, fallback_used=bool(errors))

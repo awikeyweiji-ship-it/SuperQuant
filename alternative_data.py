@@ -333,8 +333,10 @@ class AlternativeDataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 公告为空"))
@@ -366,8 +368,10 @@ class AlternativeDataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 研报为空"))
@@ -399,8 +403,10 @@ class AlternativeDataEngine:
             except Exception as e:  # noqa: BLE001
                 errors.append(build_error(name, "exception", str(e)))
                 continue
-            if data:
-                chosen = data
+            payload_items = data.get("items", []) if isinstance(data, dict) else data
+            errors.extend(data.get("errors", []) if isinstance(data, dict) else [])
+            if payload_items:
+                chosen = payload_items
                 source = name
                 break
             errors.append(build_error(name, "empty", f"{name} 热点为空"))

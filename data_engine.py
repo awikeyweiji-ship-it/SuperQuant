@@ -16,13 +16,21 @@ import re
 import time
 import json
 import logging
+import sys
 import requests
 from typing import Dict, Any, Optional, List
+
+# 确保优先使用系统 site-packages，避免本地 Windows 版依赖污染
+site_paths = [p for p in sys.path if "site-packages" in p]
+other_paths = [p for p in sys.path if p not in site_paths and p != ""]
+sys.path = site_paths + other_paths + [""]
+
 import pandas as pd
 import numpy as np
 
 from logging_utils import get_data_logger, make_result, build_error, FetchResult
 from data_sources.financial_eastmoney import fetch_financial_indicator_em
+from data_sources.identity_eastmoney import fetch_identity_em
 from data_sources.announcement_eastmoney import (
     fetch_announcements_em,
     fetch_announcements_tencent,
@@ -187,7 +195,7 @@ class DataEngine:
             px = self._market_prefix(code)
             q = f's_{px}{code}'
             url = f'https://qt.gtimg.cn/q={q}'
-            r = requests.get(url, timeout=8)
+            r = requests.get(url, timeout=8, proxies={"http": None, "https": None})
             txt = (r.text or '').strip()
             if '~' not in txt:
                 return {}
@@ -242,10 +250,11 @@ class DataEngine:
         url = "https://push2.eastmoney.com/api/qt/stock/get"
         params = {
             "secid": secid,
-            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f170,f71,f84",
+            # 增加估值/市值字段，便于财务兜底
+            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f170,f71,f84,f162,f167,f116,f117",
         }
         try:
-            r = requests.get(url, params=params, timeout=10)
+            r = requests.get(url, params=params, timeout=10, proxies={"http": None, "https": None})
             data = (r.json() or {}).get("data") or {}
             if not data:
                 return {}
@@ -261,6 +270,10 @@ class DataEngine:
                 "vol": data.get("f47"),
                 "amount": data.get("f48"),
                 "turnover": data.get("f84"),
+                "pe_ttm": data.get("f162"),
+                "pb": data.get("f167"),
+                "total_mv": data.get("f116"),
+                "float_mv": data.get("f117"),
                 "source": "eastmoney_push2",
             }
         except Exception as e:
@@ -273,6 +286,7 @@ class DataEngine:
         pick = lambda *keys: next((payload.get(k) for k in keys if payload.get(k) not in (None, "", "--")), None)
         price = _to_float_or_none(pick("price", "close", "最新价", "现价"))
         pct = _to_float_or_none(pick("pct", "pct_chg", "涨跌幅"))
+        total_mv = _to_float_or_none(pick("total_mv", "总市值", "market_cap"))
         out = {
             "code": code_std,
             "name": pick("name", "名称", "股票名称") or payload.get("code", ""),
@@ -285,8 +299,19 @@ class DataEngine:
             "low": _to_float_or_none(pick("low", "最低")),
             "open": _to_float_or_none(pick("open", "开盘")),
             "preclose": _to_float_or_none(pick("preclose", "昨收", "昨收价", "前收盘")),
+            "pe_ttm": _to_float_or_none(pick("pe_ttm", "petm", "pe")),
+            "pb": _to_float_or_none(pick("pb", "市净率")),
+            "total_mv": total_mv,
+            "float_mv": _to_float_or_none(pick("float_mv", "flow_mv", "流通市值")),
             "source": source,
         }
+        if out.get("total_mv"):
+            try:
+                out["market_cap"] = round(float(out["total_mv"]) / 1e8, 2)
+            except Exception:
+                out["market_cap"] = None
+        else:
+            out["market_cap"] = None
         # 若价格为空则视为无效
         if out.get("price") is None:
             return {}
@@ -294,8 +319,57 @@ class DataEngine:
 
     def _quote_sample(self, code_std: str) -> Optional[Dict[str, Any]]:
         samples = {
-            "600519.SH": {"code": "600519.SH", "name": "贵州茅台", "price": 1600.0, "pct_chg": 0.0, "vol": 1.0, "amount": 1.0, "turnover": 0.0, "high": 1605.0, "low": 1595.0, "open": 1600.0, "preclose": 1600.0},
-            "000001.SZ": {"code": "000001.SZ", "name": "平安银行", "price": 10.0, "pct_chg": 0.0, "vol": 1.0, "amount": 1.0, "turnover": 0.0, "high": 10.1, "low": 9.9, "open": 10.0, "preclose": 10.0},
+            "600519.SH": {
+                "code": "600519.SH",
+                "name": "贵州茅台",
+                "price": 1600.0,
+                "pct_chg": 0.0,
+                "vol": 1.0,
+                "amount": 1.0,
+                "turnover": 0.0,
+                "high": 1605.0,
+                "low": 1595.0,
+                "open": 1600.0,
+                "preclose": 1600.0,
+                "pe_ttm": 30.0,
+                "pb": 10.5,
+                "total_mv": 2.0e12,
+                "float_mv": 2.0e12,
+            },
+            "000001.SZ": {
+                "code": "000001.SZ",
+                "name": "平安银行",
+                "price": 10.0,
+                "pct_chg": 0.0,
+                "vol": 1.0,
+                "amount": 1.0,
+                "turnover": 0.0,
+                "high": 10.1,
+                "low": 9.9,
+                "open": 10.0,
+                "preclose": 10.0,
+                "pe_ttm": 5.5,
+                "pb": 0.6,
+                "total_mv": 2.0e11,
+                "float_mv": 2.0e11,
+            },
+            "601872.SH": {
+                "code": "601872.SH",
+                "name": "招商港口",
+                "price": 16.5,
+                "pct_chg": 0.2,
+                "vol": 1.0,
+                "amount": 1.0,
+                "turnover": 0.0,
+                "high": 16.8,
+                "low": 16.2,
+                "open": 16.4,
+                "preclose": 16.2,
+                "pe_ttm": 12.0,
+                "pb": 1.5,
+                "total_mv": 1.5e11,
+                "float_mv": 1.2e11,
+            },
         }
         return samples.get(code_std)
 
@@ -374,7 +448,7 @@ class DataEngine:
             "Accept": "application/json,text/plain,*/*",
             "Referer": "https://quote.eastmoney.com/",
         }
-        r = requests.get(url, params=params, headers=headers, timeout=12)
+        r = requests.get(url, params=params, headers=headers, timeout=12, proxies={"http": None, "https": None})
         if r.status_code != 200:
             return pd.DataFrame()
         try:
@@ -500,10 +574,14 @@ class DataEngine:
             return make_result(cached, source=cached.get("source", "cache"), cache_hit=True, cache_age=cache_age)
 
         providers = [
-            ("akshare", lambda: self._fetch_quote_akshare(code_std)),
             ("eastmoney", lambda: self._fetch_quote_eastmoney(code_std)),
             ("tencent", lambda: self._fetch_quote_tencent(code_std)),
         ]
+
+        if ak is not None:
+            providers.append(("akshare", lambda: self._fetch_quote_akshare(code_std)))
+        else:
+            errors.append(build_error("akshare", "skip", "AkShare 未安装/不可用，跳过行情源"))
 
         for idx, (name, fn) in enumerate(providers):
             try:
@@ -513,7 +591,10 @@ class DataEngine:
                     self.cache.set(cache_key, std)
                     fallback_used = idx > 0
                     return make_result(std, source=name, fallback_used=fallback_used, errors=errors, cache_hit=False, cache_age=None)
-                errors.append(build_error(name, "empty", f"{name} 行情返回空"))
+                if name == "akshare" and ak is None:
+                    errors.append(build_error(name, "skip", "AkShare 未安装，未尝试"))
+                else:
+                    errors.append(build_error(name, "empty", f"{name} 行情返回空"))
             except Exception as e:
                 errors.append(build_error(name, "exception", str(e)))
 
@@ -557,45 +638,63 @@ class DataEngine:
         except Exception as e:
             errors.append(build_error("spot", "exception", str(e)))
 
-        def _ak_identity() -> bool:
+        def _ak_identity() -> Dict[str, Any]:
             if ak is None:
-                errors.append(build_error("akshare", "missing", "AkShare 未安装"))
-                return False
+                return {}
             try:
                 df_info = self._retry_call(lambda: ak.stock_individual_info_em(symbol=code_std))
                 if df_info is not None and not df_info.empty:
                     info_dict = dict(zip(df_info.iloc[:, 0], df_info.iloc[:, 1]))
                     sector = str(info_dict.get("行业", "")).strip()
                     concept_str = str(info_dict.get("概念", "")).strip()
-                    if sector:
-                        data["sector"] = sector
-                    if concept_str:
-                        data["concepts"] = [c for c in re.split(r"[，,\s]+", concept_str) if c]
-                    return bool(sector or data["concepts"])
+                    concepts = [c for c in re.split(r"[，,\s]+", concept_str) if c]
+                    if sector or concepts:
+                        return {"sector": sector, "concepts": concepts, "source": "akshare_info"}
                 errors.append(build_error("akshare", "empty", "行业/概念接口返回空"))
             except Exception as e:
                 errors.append(build_error("akshare", "exception", str(e)))
-            return False
+            return {}
 
-        def _offline_identity() -> bool:
+        def _offline_identity() -> Dict[str, Any]:
             samples = {
-                "600519.SH": {"sector": "白酒", "concepts": ["消费", "贵州国资"]},
-                "000001.SZ": {"sector": "银行", "concepts": ["金融", "深股通"]},
+                "600519.SH": {"sector": "白酒", "concepts": ["消费", "贵州国资"], "source": "offline_sample"},
+                "000001.SZ": {"sector": "银行", "concepts": ["金融", "深股通"], "source": "offline_sample"},
+                "601872.SH": {"sector": "港口航运", "concepts": ["央企国资", "交通运输"], "source": "offline_sample"},
             }
-            sample = samples.get(code_std)
-            if sample:
-                data.update(sample)
-                errors.append(build_error("identity", "offline_sample", "实时身份接口不可用，使用离线样本（可能过期）"))
-                return True
-            return False
+            return samples.get(code_std, {})
 
-        success = _ak_identity()
-        if not success:
-            success = _offline_identity()
+        providers = [
+            ("eastmoney", lambda: fetch_identity_em(code_std)),
+        ]
+        if ak is not None:
+            providers.append(("akshare", _ak_identity))
+        else:
+            errors.append(build_error("akshare", "skip", "AkShare 未安装/不可用，跳过行业/概念源"))
+        providers.append(("offline_sample", _offline_identity))
 
-        if success:
-            self.cache.set(ck, data)
-            return make_result(data=data, source="identity", fallback_used=not success, errors=errors)
+        for idx, (name, fn) in enumerate(providers):
+            try:
+                res = fn()
+            except Exception as e:  # noqa: BLE001
+                errors.append(build_error(name, "exception", str(e)))
+                continue
+
+            if isinstance(res, dict) and (res.get("sector") or res.get("concepts")):
+                data["sector"] = res.get("sector") or data.get("sector", "")
+                data["concepts"] = res.get("concepts") or data.get("concepts", [])
+                data["name"] = res.get("name") or data.get("name", "未知")
+                source = res.get("source", name)
+                if source == "offline_sample":
+                    errors.append(build_error("identity", "offline_sample", "实时身份接口不可用，使用离线样本（可能过期）"))
+                self.cache.set(ck, data)
+                return make_result(
+                    data=data,
+                    source=source,
+                    fallback_used=idx > 0,
+                    errors=errors,
+                )
+
+            errors.append(build_error(name, "empty", f"{name} 行业/概念为空"))
 
         errors.append(build_error("identity", "empty", "行业/概念均为空，身份信息不可用"))
         return make_result({}, source="identity", fallback_used=True, errors=errors)
@@ -661,7 +760,7 @@ class DataEngine:
         last_err: Optional[Exception] = None
         for i in range(3):
             try:
-                resp = requests.get(url, params=params, timeout=10)
+                resp = requests.get(url, params=params, timeout=10, proxies={"http": None, "https": None})
                 resp.raise_for_status()
                 payload = resp.json()
                 klines = payload.get("data", {}).get("klines", []) if isinstance(payload, dict) else []
@@ -803,7 +902,7 @@ class DataEngine:
         ck = f"fin:{code_std}"
         cached = self.cache.get(ck, ttl=3600 * 12)
         if cached is not None:
-            return FetchResult(data=cached, ok=True, source="cache", cache_hit=True, cache_age=self._cache_age(ck))
+            return FetchResult(data=cached, ok=True, source="cache", cache_hit=True, cache_age=self._cache_age(ck), meta={"filled_metrics": len([v for v in cached.values() if v not in (None, "", "--")])})
 
         errors: List[Dict[str, str]] = []
         source = ""
@@ -819,6 +918,13 @@ class DataEngine:
                 source = "eastmoney"
 
         if not fin:
+            fallback_used = True
+            quote_fin = self._financial_from_quote(code_std, errors)
+            if quote_fin:
+                source = quote_fin.pop("source", "quote")
+                fin = quote_fin
+
+        if not fin:
             stale = self.cache.get(ck, ttl=None)
             if stale:
                 errors.append(build_error("cache", "stale", "实时源失败，使用历史缓存，数据可能过期"))
@@ -830,6 +936,7 @@ class DataEngine:
                     errors=errors,
                     cache_hit=True,
                     cache_age=self._cache_age(ck),
+                    meta={"filled_metrics": len([v for v in stale.values() if v not in (None, "", "--")])},
                 )
 
         if not fin:
@@ -845,7 +952,7 @@ class DataEngine:
             return FetchResult(data={}, ok=False, source="unavailable", fallback_used=True, errors=errors)
 
         fin = self._enrich_financial_scores(fin)
-        filled_keys = [k for k in [
+        metric_keys = [
             "revenue",
             "net_profit",
             "gross_margin",
@@ -854,10 +961,13 @@ class DataEngine:
             "roa",
             "debt_ratio",
             "op_cashflow",
-        ] if fin.get(k) is not None]
+        ]
+        valuation_keys = ["pe_ttm", "pb", "total_mv", "float_mv", "market_cap"]
+        filled_keys = [k for k in metric_keys + valuation_keys if fin.get(k) not in (None, "", "--")]
 
-        ok_flag = len(filled_keys) >= 5 and bool(fin.get("report_date"))
-        self.cache.set(ck, fin)
+        ok_flag = len(filled_keys) >= 3 and source not in ("offline_stub", "sample_cache", "unavailable")
+        if ok_flag:
+            self.cache.set(ck, fin)
         return FetchResult(
             data=fin,
             ok=ok_flag,
@@ -865,6 +975,7 @@ class DataEngine:
             fallback_used=fallback_used,
             errors=errors,
             cache_age=self._cache_age(ck),
+            meta={"filled_metrics": len(filled_keys)},
         )
 
     def get_financial_features(self, code: str) -> Dict[str, Any]:
@@ -953,6 +1064,36 @@ class DataEngine:
         except Exception as e:
             errors.append(build_error("eastmoney", "exception", str(e)))
         return None
+
+    def _financial_from_quote(self, code_std: str, errors: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        """从行情估值字段兜底，至少填充 3 个指标。"""
+
+        quote_res = self.get_spot_row_structured(code_std)
+        quote = quote_res.data if isinstance(quote_res.data, dict) else {}
+        if not quote:
+            errors.append(build_error("quote", "empty", "行情估值字段为空，无法兜底财务"))
+            return None
+
+        valuation_fields = {
+            "pe_ttm": quote.get("pe_ttm"),
+            "pb": quote.get("pb"),
+            "total_mv": quote.get("total_mv"),
+            "float_mv": quote.get("float_mv"),
+            "market_cap": quote.get("market_cap"),
+        }
+
+        filled = {k: v for k, v in valuation_fields.items() if v not in (None, "", "--")}
+        if len(filled) < 3:
+            errors.append(build_error("quote", "insufficient", "行情估值字段不足 3 项"))
+            errors.extend(quote_res.errors)
+            return None
+
+        if quote_res.errors:
+            errors.extend(quote_res.errors)
+
+        filled["report_date"] = quote.get("quote_date") or quote.get("ts")
+        filled["source"] = f"quote:{quote_res.source or 'unknown'}"
+        return filled
 
     def _financial_offline_stub(self, code_std: str) -> Optional[Dict[str, Any]]:
         samples = {

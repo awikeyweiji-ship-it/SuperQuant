@@ -189,6 +189,14 @@ class CapitalEngine:
                 "margin_balance": 1.5e10,
                 "margin_date": "离线样本",  # noqa: EM101
             },
+            "601872.SH": {
+                "main_net_inflow": 2.8e8,
+                "large_net_inflow": 1.4e8,
+                "super_large_net_inflow": 0.6e8,
+                "northbound_net_inflow": 1.2e8,
+                "margin_balance": 8.0e9,
+                "margin_date": "离线样本",  # noqa: EM101
+            },
         }
         return samples.get(code_std, {})
 

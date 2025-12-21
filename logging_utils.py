@@ -36,6 +36,7 @@ class FetchResult:
     ts: float = field(default_factory=lambda: time.time())
     cache_hit: bool = False
     cache_age: Optional[float] = None
+    meta: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -47,6 +48,7 @@ class FetchResult:
             "ts": self.ts,
             "cache_hit": self.cache_hit,
             "cache_age": self.cache_age,
+            "meta": self.meta,
         }
 
 
@@ -61,6 +63,7 @@ def make_result(
     errors: Optional[List[Dict[str, str]]] = None,
     cache_hit: bool = False,
     cache_age: Optional[float] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> FetchResult:
     ok = False
     if isinstance(data, dict):
@@ -80,4 +83,5 @@ def make_result(
         errors=errors or [],
         cache_hit=cache_hit,
         cache_age=cache_age,
+        meta=meta,
     )

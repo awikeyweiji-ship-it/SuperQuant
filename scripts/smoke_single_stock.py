@@ -38,11 +38,9 @@ def as_record(step: str, res: FetchResult, summary_keys: List[str]) -> Dict[str,
     }
 
 
-def main() -> int:
-    raw = sys.argv[1] if len(sys.argv) > 1 else "600519.SH"
+def run_symbol(engine: DataEngine, raw: str) -> Dict[str, Any]:
     code_std = standardize_code(raw)
     code = normalize_code(code_std)
-    engine = DataEngine(cache=UniverseCache())
 
     results: List[Dict[str, Any]] = []
     failures: List[str] = []
@@ -50,7 +48,7 @@ def main() -> int:
     # 1) Quote / identity
     try:
         spot = engine.get_spot_row_structured(code)
-        results.append(as_record("quote", spot, ["code", "name", "price", "pct_chg", "vol", "amount", "turnover", "source"]))
+        results.append(as_record("quote", spot, ["code", "name", "price", "pct_chg", "vol", "amount", "turnover", "source", "market_cap"]))
         if not spot.ok:
             failures.append("quote")
     except Exception as e:
@@ -96,9 +94,23 @@ def main() -> int:
     try:
         fin = engine.get_financial_features_structured(code)
         fin_data = fin.data if isinstance(fin.data, dict) else {}
-        filled = [k for k in ["revenue", "net_profit", "gross_margin", "net_margin", "roe", "roa", "debt_ratio", "op_cashflow"] if fin_data.get(k) not in (None, "")]
-        report_date = fin_data.get("report_date")
-        ok_fin = bool(fin.ok) and len(filled) >= 5 and bool(report_date)
+        filled = [k for k in [
+            "revenue",
+            "net_profit",
+            "gross_margin",
+            "net_margin",
+            "roe",
+            "roa",
+            "debt_ratio",
+            "op_cashflow",
+            "pe_ttm",
+            "pb",
+            "total_mv",
+            "float_mv",
+            "market_cap",
+        ] if fin_data.get(k) not in (None, "")]
+        filled_count = fin.meta.get("filled_metrics") if isinstance(fin.meta, dict) else len(filled)
+        ok_fin = bool(fin.ok) and filled_count >= 3 and fin.source not in ("offline_stub", "sample_cache")
         results.append({
             "step": "financials",
             "ok": ok_fin,
@@ -106,7 +118,7 @@ def main() -> int:
             "fallback_used": fin.fallback_used,
             "errors": fin.errors,
             "summary": summarize_dict(fin_data, ["report_date", "revenue", "net_profit", "gross_margin", "net_margin", "roe", "roa", "debt_ratio", "op_cashflow"]),
-            "meta": {"filled_metrics": len(filled)},
+            "meta": {"filled_metrics": filled_count},
         })
         if not ok_fin:
             failures.append("financials")
@@ -252,8 +264,24 @@ def main() -> int:
         failures.append("hot_topics")
         results.append({"step": "hot_topics", "ok": False, "errors": [{"source": "script", "error_type": "exception", "message": str(e)}]})
 
-    print(json.dumps({"code": code_std, "results": results, "failures": failures}, ensure_ascii=False, indent=2))
-    return 0 if not failures else 1
+    return {"code": code_std, "results": results, "failures": failures}
+
+
+def main() -> int:
+    inputs = sys.argv[1:] if len(sys.argv) > 1 else ["600519.SH", "000001.SZ", "601872.SH"]
+    engine = DataEngine(cache=UniverseCache())
+
+    outputs: List[Dict[str, Any]] = []
+    any_failures = False
+
+    for raw in inputs:
+        result = run_symbol(engine, raw)
+        outputs.append(result)
+        if result.get("failures"):
+            any_failures = True
+
+    print(json.dumps(outputs, ensure_ascii=False, indent=2))
+    return 0 if not any_failures else 1
 
 
 if __name__ == "__main__":

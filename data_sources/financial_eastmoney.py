@@ -54,10 +54,24 @@ def fetch_financial_indicator_em(code_std: str, timeout: float = 8.0) -> Optiona
         return None
     try:
         df = pd.DataFrame(report_list)
-        return df
     except Exception:
         try:
-            return pd.DataFrame(json.loads(report_list))  # type: ignore[arg-type]
+            df = pd.DataFrame(json.loads(report_list))  # type: ignore[arg-type]
         except Exception:
             return None
+
+    if df is None or df.empty:
+        return None
+
+    # 归一化列名并按报告期倒序，取最新一期
+    df.columns = [str(c).lower() for c in df.columns]
+    for col in ["reportdate", "fdate", "report_date"]:
+        if col in df.columns:
+            try:
+                df[col] = pd.to_datetime(df[col]).dt.date
+            except Exception:
+                pass
+            df = df.sort_values(col, ascending=False)
+            break
+    return df
 

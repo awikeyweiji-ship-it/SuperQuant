@@ -551,7 +551,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         # 1. 核心决策头 (Header)
         st.markdown("---")
         id_name = (dp.get('identity') or {}).get('name') or dp.get('code')
-        sector = (dp.get('identity') or {}).get('sector', '') or '未知行业'
+        sector = (dp.get('identity') or {}).get('sector', '') or '-'
         st.markdown(f"### {id_name} ({dp.get('code')}) | <span class='tag-concept'>{sector}</span>", unsafe_allow_html=True)
 
         c_h1, c_h2, c_h3, c_h4 = st.columns(4)
@@ -563,7 +563,9 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         decision = rep.get('decision', '观望')
         color_cls = "decision-buy" if "买" in decision or "潜伏" in decision else "decision-sell" if "卖" in decision or "清" in decision else ""
         c_h3.markdown(f"**决策: <span class='{color_cls}'>{decision}</span>**", unsafe_allow_html=True)
-        c_h4.metric("市值", f"{md.get('market_cap')}亿")
+        mc_val = md.get('market_cap')
+        mc_display = "-" if mc_val in (None, "", 0) else f"{mc_val}亿"
+        c_h4.metric("市值", mc_display)
 
         with st.expander("🩺 数据链路诊断"):
             diag_rows = []
@@ -601,15 +603,15 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             with col_q:
                 price = md.get('close') or md.get('price')
                 pct = md.get('pct') or md.get('pct_chg')
-                st.metric("现价", price, f"{pct}%" if pct is not None else None)
-                st.write(f"成交额: {md.get('amount')} | 量比: {md.get('vol_ratio')}")
+                st.metric("现价", price if price is not None else "-", f"{pct}%" if pct is not None else None)
+                st.write(f"成交额: {md.get('amount') or '-'} | 量比: {md.get('vol_ratio') or '-'}")
                 _render_meta(quote_meta)
                 if not quote_meta.get("ok"):
                     _render_errors(quote_meta.get("errors"))
             with col_id:
-                st.write(f"行业: {sector}")
+                st.write(f"行业: {sector or '-'}")
                 concepts = (dp.get('identity') or {}).get('concepts') or []
-                st.write("概念: " + ("，".join(concepts) if concepts else "无"))
+                st.write("概念: " + ("，".join(concepts) if concepts else "-"))
                 _render_meta(identity_meta)
                 if not identity_meta.get("ok"):
                     _render_errors(identity_meta.get("errors"))

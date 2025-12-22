@@ -27,7 +27,13 @@ def _fail(message: str) -> None:
 
 
 def main():
+    if len(sys.argv) < 2:
+        _fail("TuShare token missing: usage python scripts/smoke_radar.py <tushare_token>")
+    token = sys.argv[1]
+    if not token:
+        _fail("TuShare token empty")
     engine = DataEngine(cache=UniverseCache())
+    engine.ts_token = token  # stored for downstream usage where applicable
     radar = OpportunityRadar(engine)
     radar.capital_engine = None  # 避免资金流接口在无网环境长时间阻塞
     codes = load_codes(engine, 25)

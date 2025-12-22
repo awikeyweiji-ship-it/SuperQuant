@@ -82,6 +82,7 @@ from data_sources.report_eastmoney import (
 from data_sources.hot_eastmoney import fetch_hot_topics_em, fetch_hot_topics_ak, sample_hot_topics
 from data_sources.quote_sina_live import infer_prefix
 from data_sources import quote_sina_live, quote_tencent_live, kline_tencent_v2, news_sina_stock
+from data_sources import quote_legacy, kline_legacy
 from data_sources import kline_sohu
 from data_sources import cninfo_client
 
@@ -2076,9 +2077,11 @@ class DataEngine:
     def single_stock(self, raw_code: str) -> Dict[str, Any]:
         ident = self._normalize_primary_code(raw_code)
         registry = ProviderRegistry()
+        registry.register("quote", "quote_legacy", quote_legacy.fetch, priority=100)
         registry.register("quote", "quote_sina", quote_sina_live.fetch, priority=20)
         registry.register("quote", "quote_tencent", quote_tencent_live.fetch, priority=15)
 
+        registry.register("kline", "kline_legacy", kline_legacy.fetch, priority=100)
         registry.register("kline", "kline_baostock", fetch_kline_baostock, priority=60)
         registry.register("kline", "kline_tencent", kline_tencent_v2.fetch, priority=20)
         registry.register("kline", "kline_akshare", lambda code, **_: self._akshare_kline_provider(code), priority=10)

@@ -7,11 +7,12 @@ Generated: 2025-12-22T00:00:00Z
 - Platform: Linux
 
 ## Commands Executed
-- `python scripts/smoke_single_stock.py 600519 <TOKEN>` -> not run (TuShare token not available in CI container).
-- `python scripts/smoke_radar.py <TOKEN>` -> not run (TuShare token not available in CI container).
+- `python -m compileall .` -> ✅ (compilation completed)
+- `python scripts/smoke_single_stock.py 600519` -> ❌ (sandbox network/proxy blocks all market feeds; baostock not available here)
 
 ### Logs
-- Smokes are gated on an explicit TuShare Pro token argument. Without a provided token, the scripts intentionally exit with usage guidance and do not attempt network calls.
+- compileall produced bytecode for the repo without errors.
+- Smoke run failed because outbound requests to Sina/Tencent/Akshare/Eastmoney/CNINFO were blocked by the proxy (HTTP 403) and `baostock` is missing in this sandbox, so quote/K线/公告/财务 payloads remained empty. The smoke script still enforces >=120 K线 rows, >=8 financial numeric fields, and at least one announcement item.
 
 ## Status
-TuShare Pro is now the primary data backbone. A valid TuShare token must be entered via the Streamlit sidebar or passed to smoke scripts for real data. In this container no token is available, so connectivity and data retrieval were not exercised; users should supply their own TuShare Pro token locally to validate non-empty outputs.
+Legacy quote/K线 providers have been restored as highest priority with BaoStock fallback and derived-price labeling to avoid blank prices. Run the smoke again on a networked Windows host with `pip install -r requirements.txt` to validate real data availability.

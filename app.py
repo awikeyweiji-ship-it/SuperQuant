@@ -251,6 +251,78 @@ def _fmt_val(val, suffix: str = ""):
     return f"{val}{suffix}" if suffix else str(val)
 
 
+def _normalize_trade_date(val: Any) -> Optional[str]:
+    try:
+        if isinstance(val, (datetime, date)):
+            return val.strftime("%Y-%m-%d")
+        s = str(val).strip()
+        if not s:
+            return None
+        if re.fullmatch(r"\d{8}", s):
+            return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            return s
+        return s.split(" ")[0]
+    except Exception:
+        return None
+
+
+def _extract_latest_close(kline_obj) -> tuple[Optional[float], Optional[str]]:
+    """Safely extract the latest close and date from flexible kline payloads."""
+
+    def _as_float(val: Any) -> Optional[float]:
+        try:
+            f = float(val)
+            if np.isnan(f) or np.isinf(f):
+                return None
+            return f
+        except Exception:
+            return None
+
+    close_candidates = {"close", "closing", "收盘", "收盘价"}
+    date_candidates = {"date", "trade_date", "时间", "日期", "day"}
+    pd = _get_pandas()
+
+    if kline_obj is None:
+        return None, None
+
+    # pandas DataFrame path
+    if pd is not None and isinstance(kline_obj, pd.DataFrame):
+        df = kline_obj
+        if df.empty:
+            return None, None
+        mapping = {str(col).lower(): col for col in df.columns}
+        close_col = next((mapping[c] for c in mapping if c in close_candidates), None)
+        if close_col is None:
+            return None, None
+        date_col = next((mapping[c] for c in mapping if c in date_candidates), None)
+        df_work = df.dropna(subset=[close_col]) if close_col in df.columns else df
+        if date_col and date_col in df_work.columns:
+            try:
+                df_work = df_work.sort_values(by=date_col)
+            except Exception:
+                pass
+            latest_row = df_work.iloc[-1]
+            return _as_float(latest_row.get(close_col)), _normalize_trade_date(latest_row.get(date_col))
+        latest_row = df_work.iloc[-1]
+        return _as_float(latest_row.get(close_col)), None
+
+    # list of dicts path
+    if isinstance(kline_obj, list):
+        for item in reversed(kline_obj):
+            if not isinstance(item, dict):
+                continue
+            item_lower = {str(k).lower(): v for k, v in item.items()}
+            close_val = next((item_lower.get(c) for c in close_candidates if c in item_lower), None)
+            close_val = _as_float(close_val)
+            if close_val is None:
+                continue
+            date_val = next((item_lower.get(c) for c in date_candidates if c in item_lower), None)
+            return close_val, _normalize_trade_date(date_val)
+
+    return None, None
+
+
 def _render_errors(errors):
     if not errors:
         st.caption("无错误")
@@ -277,10 +349,7 @@ def _safe_fetch(fn, label: str) -> FetchResult:
 def _safe_holistic(engine, code: str):
     code_std = standardize_code(code)
     try:
-        res = engine.single_stock_tushare(
-            code_std,
-            token=st.session_state.get("tushare_token"),
-        )
+        res = engine.single_stock(code_std)
         meta = res.get("_meta") if isinstance(res, dict) else {}
         res["_meta"] = meta if isinstance(meta, dict) else {}
         res["market_data"] = res.get("quote", {})
@@ -661,6 +730,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         money_meta = _as_dict(meta_map.get("money_flow"))
         alt_meta = _as_dict(meta_map.get("alternative"))
         news_meta = _as_dict(meta_map.get("news_bundle"))
+        ann_meta = _as_dict(meta_map.get("announcements"))
 
         # 1. 核心决策头 (Header)
         st.markdown("---")
@@ -671,8 +741,33 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         c_h1, c_h2, c_h3, c_h4 = st.columns(4)
         dp = _as_dict(dp)
         md = _as_dict(dp.get('market_data'))
-        c_h1.metric("现价", _fmt_val(md.get('close') or md.get('price')), _fmt_val(md.get('pct') or md.get('pct_chg'), suffix="%"))
+        raw_close = md.get('close') or md.get('price')
+        pct_delta = _fmt_val(md.get('pct') or md.get('pct_chg'), suffix="%")
+
+        def _valid_float(val: Any) -> Optional[float]:
+            try:
+                f = float(val)
+                if np.isnan(f) or np.isinf(f):
+                    return None
+                return f
+            except Exception:
+                return None
+
+        derived_close, derived_date = (None, None)
+        close_for_display = raw_close
+        if _valid_float(close_for_display) is None:
+            derived_close, derived_date = _extract_latest_close(dp.get('kline_daily') or dp.get('kline'))
+            if derived_close is not None:
+                close_for_display = derived_close
+
+        c_h1.metric("现价", _fmt_val(close_for_display), pct_delta)
+        if derived_close is not None:
+            latest_date = derived_date or "未知"
+            c_h1.caption(f"(非实时：最新收盘价 {latest_date})")
         c_h2.metric("AI 综合评分", _fmt_val(rep.get('ai_score')))
+        st.caption(
+            f"行情源: {quote_meta.get('source') or '-'} | K线源: {kline_meta.get('source') or '-'} | 财报源: {fin_meta.get('source') or '-'} | 公告源: {ann_meta.get('source') or '-'}"
+        )
 
         # 决策高亮
         decision = rep.get('decision', '观望')
@@ -749,8 +844,16 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             with col_q:
                 price = md.get('close') or md.get('price')
                 pct = md.get('pct') or md.get('pct_chg')
+                if price is None:
+                    derived_px, derived_dt = _extract_latest_close(dp.get('kline_daily') or dp.get('kline'))
+                    price = derived_px
+                    if derived_px is not None:
+                        st.caption(f"(非实时：最新收盘价 {derived_dt or '未知'})")
                 st.metric("现价", price if price is not None else "-", f"{pct}%" if pct is not None else None)
                 st.write(f"成交额: {md.get('amount') or '-'} | 量比: {md.get('vol_ratio') or '-'}")
+                st.caption(
+                    f"行情来源: {quote_meta.get('source') or '-'} | 报价: {'非实时(收盘价)' if quote_meta.get('latest_price_non_realtime') else '实时'} | 推导: {'是' if quote_meta.get('is_derived') else '否'}"
+                )
                 _render_meta(quote_meta)
                 if not quote_meta.get("ok"):
                     _render_errors(quote_meta.get("errors"))

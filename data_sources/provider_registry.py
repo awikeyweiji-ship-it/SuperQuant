@@ -6,7 +6,24 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-ProviderFunc = Callable[..., Dict[str, Any]]
+ProviderFunc = Callable[..., "ProviderResult | Dict[str, Any]"]
+
+
+@dataclass
+class ProviderResult:
+    """Standardized provider output used for provider arbitration."""
+
+    data: Dict[str, Any]
+    filled_metrics: int
+    errors: List[Dict[str, Any]]
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self, default_source: str) -> Dict[str, Any]:
+        meta = {"source": default_source, "retrieved_at": time.time(), **(self.meta or {})}
+        meta.setdefault("errors", self.errors or [])
+        meta.setdefault("filled_metrics", self.filled_metrics or 0)
+        meta.setdefault("errors_count", len(meta.get("errors") or []))
+        return {"data": self.data or {}, "meta": meta}
 
 
 @dataclass(order=True)
@@ -27,6 +44,22 @@ class ProviderRegistry:
 
     def get_providers(self, domain: str) -> List[ProviderEntry]:
         return list(self._providers.get(domain, []))
+
+
+def _normalize_payload(raw: Any, default_source: str) -> Dict[str, Any]:
+    if isinstance(raw, ProviderResult):
+        return raw.to_payload(default_source)
+    if isinstance(raw, dict):
+        meta = raw.get("meta") or {}
+        meta.setdefault("source", default_source)
+        meta.setdefault("retrieved_at", time.time())
+        meta.setdefault("errors", meta.get("errors") or [])
+        meta.setdefault("filled_metrics", meta.get("filled_metrics") or 0)
+        meta.setdefault("errors_count", len(meta.get("errors") or []))
+        raw["meta"] = meta
+        raw.setdefault("data", {})
+        return raw
+    return {"data": {}, "meta": {"source": default_source, "retrieved_at": time.time(), "errors": [], "filled_metrics": 0}}
 
 
 def run_providers_parallel(
@@ -72,21 +105,20 @@ def run_providers_parallel(
                 try:
                     remaining = max(0.1, timeout - (time.time() - start_wait))
                     payload, elapsed = future.result(timeout=remaining)
-                    payload = payload or {}
+                    payload = _normalize_payload(payload, entry.name)
                     meta = payload.get("meta") or {}
-                    meta.setdefault("source", entry.name)
-                    meta.setdefault("retrieved_at", time.time())
-                    meta.setdefault("errors", [])
-                    meta.setdefault("filled_metrics", 0)
-                    meta.setdefault("errors_count", len(meta.get("errors") or []))
+                    meta.setdefault("elapsed", meta.get("elapsed") or meta.get("duration") or elapsed)
                     if identity:
                         meta.setdefault("used_key", identity)
                     traces.append(
                         {
                             "provider": entry.name,
                             "success": True,
-                            "elapsed": meta.get("elapsed") or meta.get("duration") or elapsed,
+                            "elapsed": meta.get("elapsed"),
                             "errors": meta.get("errors", []),
+                            "url": meta.get("url"),
+                            "status_code": meta.get("status_code"),
+                            "body_snippet": meta.get("body_snippet"),
                             "filled_metrics": meta.get("filled_metrics", 0),
                             "errors_count": meta.get("errors_count", len(meta.get("errors") or [])),
                         }
@@ -129,7 +161,14 @@ def run_providers_parallel(
             ts = 0
         return (filled, -err_cnt, entry.priority, ts)
 
-    best_entry, best_payload = sorted(results, key=_score, reverse=True)[0]
+    sorted_results = sorted(results, key=_score, reverse=True)
+    best_entry, best_payload = sorted_results[0]
+    # rule: do not pick filled_metrics=0 if any provider has >0
+    if (best_payload.get("meta") or {}).get("filled_metrics", 0) == 0:
+        for entry, payload in sorted_results:
+            if (payload.get("meta") or {}).get("filled_metrics", 0) > 0:
+                best_entry, best_payload = entry, payload
+                break
     meta = best_payload.get("meta") or {}
     meta.setdefault("source", best_entry.name)
     meta.setdefault("retrieved_at", time.time())

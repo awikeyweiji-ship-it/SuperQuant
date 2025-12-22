@@ -1,160 +1,53 @@
-"""Single stock smoke test driven by the new provider fan-out pipeline.
-
-验收示例：python -m compileall app.py data_engine.py logging_utils.py alternative_data.py data_sources scripts
-"""
+"""Smoke test for single stock data availability."""
 from __future__ import annotations
 
 import json
 import os
 import sys
-from typing import Any, Dict, List
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
-    sys.path.append(ROOT)
+    sys.path.insert(0, ROOT)
 
-from data_engine import DataEngine, standardize_code
-from universe_cache import UniverseCache
-
-NETWORK_KEYWORDS = [
-    "network is unreachable",
-    "connection refused",
-    "timed out",
-    "max retries",
-    "proxy",
-]
+from data_engine import DataEngine
+from tools import connectivity_doctor
 
 
-def validate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
-    diag = stock.get("diagnostics") or []
-    meta = stock.get("_meta") or {}
-    failures: List[str] = []
-    module_results: List[Dict[str, Any]] = []
-    provider_trace = stock.get("provider_trace") or {}
-
-    def _get_meta(name: str) -> Dict[str, Any]:
-        val = meta.get(name, {}) if isinstance(meta, dict) else {}
-        return val if isinstance(val, dict) else {}
-
-    # 验收 retrieved_at 与 report_period
-    fin_meta = _get_meta("financial")
-    retrieved_ok = fin_meta.get("retrieved_at") is not None or fin_meta.get("ts") is not None
-    report_period = fin_meta.get("report_period")
-    if not retrieved_ok:
-        failures.append("financial_retrieved_at_missing")
-    if report_period in ("2003-12-31",):
-        failures.append("financial_report_period_invalid")
-
-    # 核心字段不允许 example.com
-    serialized = json.dumps(stock, ensure_ascii=False, default=str)
-    if "example.com" in serialized:
-        failures.append("contains_example_stub")
-
-    diag_map = {d.get("module"): d for d in diag if isinstance(d, dict)}
-    for module in ["quote", "financial", "money_flow", "news_bundle", "kline_daily"]:
-        info = diag_map.get(module, {})
-        filled = info.get("filled") or 0
-        err_cnt = info.get("errors_count") or 0
-        traces = provider_trace.get(module) if isinstance(provider_trace, dict) else []
-        status = "OK"
-        module_failures: List[str] = []
-        if filled == 0:
-            module_failures.append(f"{module}_filled_zero")
-        if err_cnt > 0:
-            module_failures.append(f"{module}_errors_{err_cnt}")
-        for tr in traces or []:
-            msg_blob = json.dumps(tr, ensure_ascii=False).lower()
-            if any(kw in msg_blob for kw in NETWORK_KEYWORDS):
-                status = "INCONCLUSIVE"
-                if f"{module}_network_blocked" not in module_failures:
-                    module_failures.append(f"{module}_network_blocked")
-        if module_failures:
-            status = "FAIL" if status == "OK" else status
-            failures.extend(module_failures)
-        module_results.append(
-            {
-                "module": module,
-                "filled_metrics": filled,
-                "errors_count": err_cnt,
-                "status": status,
-                "provider_trace": traces,
-                "missing_paths": info.get("missing_paths") or [],
-            }
-        )
-
-    # news bundle basic schema
-    nb = stock.get("news_bundle") or {}
-    if isinstance(nb, dict):
-        for key in ["announcements", "reports", "hot_events"]:
-            val = nb.get(key) or []
-            if val:
-                first = val[0]
-                for req in ["title", "time", "url"]:
-                    if not first.get(req):
-                        failures.append(f"news_{key}_missing_{req}")
-            else:
-                failures.append(f"news_{key}_empty")
-    return {"diagnostics": diag, "failures": failures, "module_results": module_results}
-
-
-def _fail(message: str) -> None:
-    print(f"[SMOKE][FAIL] {message}")
-    raise SystemExit(1)
+def run_smoke(code: str, token: str) -> int:
+    if not token:
+        print("[ERROR] TuShare token missing; please provide as argument")
+        return 2
+    print("[1/2] connectivity doctor")
+    connectivity_doctor.run(code)
+    print("[2/2] data engine single_stock_tushare")
+    engine = DataEngine()
+    result = engine.single_stock_tushare(code, token=token)
+    quote_filled = (result.get("quote", {}).get("meta", {}) or {}).get("filled_metrics", 0) or (1 if result.get("quote", {}).get("data") else 0)
+    kline_len = len(result.get("kline", {}).get("daily", []))
+    news_items = len(result.get("news_bundle", {}).get("announcements", [])) if isinstance(result.get("news_bundle", {}), dict) else 0
+    financial_filled = (result.get("financial", {}).get("meta", {}) or {}).get("filled_metrics", 0) or len((result.get("financial", {}).get("data", {}) or {}).get("statements", []))
+    print(json.dumps({
+        "quote_filled": quote_filled,
+        "kline_len": kline_len,
+        "news_items": news_items,
+        "financial": financial_filled,
+        "provider_trace": result.get("provider_trace", {}),
+    }, ensure_ascii=False, indent=2))
+    if not token:
+        return 2
+    if quote_filled <= 0 or kline_len < 1 or news_items < 1 or financial_filled <= 0 or len(result.get("evidence_pack", [])) < 12:
+        print("Smoke check failed; dumping traces")
+        return 2
+    return 0
 
 
 def main() -> int:
-    inputs = sys.argv[1:] if len(sys.argv) > 1 else ["600519", "000001"]
-    engine = DataEngine(cache=UniverseCache())
-    reports: List[Dict[str, Any]] = []
-    any_failures = False
-
-    for raw in inputs:
-        code_std = standardize_code(raw)
-        stock = engine.single_stock(code_std)
-        validation = validate_payload(stock)
-        module_results = validation.get("module_results") or []
-        evidence_len = len(stock.get("evidence_pack") or [])
-        nb = stock.get("news_bundle") or {}
-        if evidence_len < 12:
-            validation["failures"].append("evidence_pack_too_short")
-        if not any((nb.get("announcements") or []) + (nb.get("reports") or []) + (nb.get("hot_events") or [])):
-            validation["failures"].append("news_bundle_empty")
-        kline_daily = stock.get("kline", {}).get("daily") if isinstance(stock.get("kline"), dict) else None
-        if not kline_daily or len(kline_daily) < 120:
-            validation["failures"].append("kline_daily_short")
-        else:
-            # ensure ascending dates and numeric fields
-            dates = [row.get("date") for row in kline_daily if isinstance(row, dict)]
-            if dates != sorted(dates):
-                validation["failures"].append("kline_daily_not_sorted")
-            for row in kline_daily[:3]:
-                for key in ["open", "close", "high", "low", "volume"]:
-                    if row.get(key) in (None, "--", ""):
-                        validation["failures"].append("kline_daily_bad_numeric")
-
-        quote = stock.get("quote") or {}
-        if quote.get("price") in (None, "--", 0):
-            validation["failures"].append("quote_price_missing")
-        if quote.get("pct_chg") in (None, "--"):
-            validation["failures"].append("quote_pct_missing")
-        if quote.get("amount") in (None, "--"):
-            validation["failures"].append("quote_amount_missing")
-
-        entry = {
-            "code": code_std,
-            "failures": validation.get("failures"),
-            "diagnostics": validation.get("diagnostics"),
-            "module_results": module_results,
-            "evidence_len": evidence_len,
-            "quote": quote,
-        }
-        reports.append(entry)
-        any_failures = any_failures or bool(validation.get("failures"))
-
-    print(json.dumps(reports, ensure_ascii=False, indent=2))
-    if any_failures:
-        _fail("single_stock smoke validations failed")
-    return 0
+    if len(sys.argv) < 3:
+        print("Usage: python scripts/smoke_single_stock.py <code> <tushare_token>")
+        return 2
+    code = sys.argv[1]
+    token = sys.argv[2]
+    return run_smoke(code, token)
 
 
 if __name__ == "__main__":

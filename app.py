@@ -24,6 +24,7 @@ from plotly.subplots import make_subplots
 # 引入核心组件
 from universe_cache import UniverseCache
 from data_engine import DataEngine, normalize_code, standardize_code
+from tools.connectivity_doctor_v2 import probe_endpoints
 from market_scanner import MarketScanner, ScanConfig
 from deep_search_agent import DeepSearchAgent
 from radiation_engine import RadiationEngine
@@ -156,6 +157,16 @@ with st.sidebar.expander("🔑 神经连接 (API Keys)", expanded=True):
     st.session_state["api_key"] = ds_key
     st.session_state["tavily_key"] = tavily_key
 
+with st.sidebar.expander("💠 TuShare Pro", expanded=True):
+    ts_token = st.text_input("TuShare Pro Token", type="password", value=st.session_state.get("tushare_token", ""))
+    if st.button("Test TuShare Connectivity", use_container_width=True):
+        test_engine = st.session_state.get("engine") or DataEngine()
+        ok, msg = test_engine.test_tushare(ts_token)
+        (st.success if ok else st.error)(msg)
+    st.session_state["tushare_token"] = ts_token
+    if not ts_token:
+        st.warning("未提供 TuShare Token，单股与雷达将阻断并提示补充 token")
+
 offline_mode = st.sidebar.checkbox(
     "离线样本模式（允许使用本地样本 fallback）",
     value=os.environ.get("ALLOW_OFFLINE_SAMPLES", "").lower() in {"1", "true", "yes", "on"},
@@ -169,6 +180,11 @@ os.environ["FORCE_REFRESH"] = "1" if force_refresh else "0"
 st.session_state["offline_mode_flag"] = offline_mode
 st.session_state["sample_mode"] = sample_mode
 st.session_state["force_refresh"] = force_refresh
+
+with st.sidebar.expander("🔎 连接自检", expanded=False):
+    if st.button("运行 Connectivity Doctor v2", use_container_width=True):
+        results = probe_endpoints()
+        st.json(results)
 
 pd_err_msg = _pd_error_message()
 if pd_err_msg:
@@ -261,11 +277,9 @@ def _safe_fetch(fn, label: str) -> FetchResult:
 def _safe_holistic(engine, code: str):
     code_std = standardize_code(code)
     try:
-        res = engine.single_stock(
+        res = engine.single_stock_tushare(
             code_std,
-            sample_mode=st.session_state.get("sample_mode", False),
-            offline_mode=st.session_state.get("offline_mode_flag", False),
-            force_refresh=st.session_state.get("force_refresh", False),
+            token=st.session_state.get("tushare_token"),
         )
         meta = res.get("_meta") if isinstance(res, dict) else {}
         res["_meta"] = meta if isinstance(meta, dict) else {}

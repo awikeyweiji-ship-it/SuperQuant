@@ -2037,7 +2037,9 @@ class DataEngine:
         try:
             if ak is None:
                 raise RuntimeError("akshare missing")
-            symbol = f"{infer_prefix(code)}{code}"
+            # Use the plain 6-digit code as in the v1 working pipeline; akshare expects this format
+            # and returns the most stable forward-adjusted daily bars.
+            symbol = normalize_code(code)
             df = ak.stock_zh_a_hist(symbol=symbol, adjust="qfq")  # type: ignore[attr-defined]
             if df is not None and not df.empty:
                 df = df.tail(limit)
@@ -2079,7 +2081,12 @@ class DataEngine:
         try:
             if ak is None or pd is None:
                 raise RuntimeError("akshare/pandas missing")
-            df = ak.stock_zh_a_spot_em()  # type: ignore[attr-defined]
+            cache_key = "akshare_spot_snapshot"
+            df = self.cache.get_df(cache_key, ttl=180)
+            if df is None or df.empty:
+                df = ak.stock_zh_a_spot_em()  # type: ignore[attr-defined]
+                if df is not None and not df.empty:
+                    self.cache.set_df(cache_key, df)
             if df is not None and not df.empty:
                 candidates = ["代码", "股票代码", "code", "symbol"]
                 col_code = next((c for c in candidates if c in df.columns), None)

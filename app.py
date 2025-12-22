@@ -754,7 +754,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         c_h1.metric("现价", _fmt_val(close_for_display), pct_delta)
         if derived_close is not None:
             latest_date = derived_date or "未知"
-            c_h1.caption(f"非实时收盘价(derived)：{latest_date}")
+            c_h1.caption(f"非实时：使用最近收盘价 {latest_date}")
         c_h2.metric("AI 综合评分", _fmt_val(rep.get('ai_score')))
         st.caption(
             f"行情源: {quote_meta.get('source') or '-'} | K线源: {kline_meta.get('source') or '-'} | 财报源: {fin_meta.get('source') or '-'} | 公告源: {ann_meta.get('source') or '-'}"
@@ -879,7 +879,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                     derived_px, derived_dt = _extract_latest_close(dp.get('kline_daily') or dp.get('kline'))
                     price = derived_px
                     if derived_px is not None:
-                        st.caption(f"(非实时：最新收盘价 {derived_dt or '未知'})")
+                        st.caption(f"(非实时：使用最近收盘价 {derived_dt or '未知'})")
                 st.metric("现价", price if price is not None else "-", f"{pct}%" if pct is not None else None)
                 st.write(f"成交额: {md.get('amount') or '-'} | 量比: {md.get('vol_ratio') or '-'}")
                 st.caption(

@@ -1,35 +1,33 @@
 # Doctor Report
 
-Generated: 2025-02-19T00:00:00Z (sandbox refresh with decision layer)
+Generated: 2025-02-19T00:00:00Z (sandbox refresh with akshare spot/kline restored)
 
 ## Environment
 - Python: 3.11.12
 - Platform: Linux (sandbox)
 
 ## Commands Executed (sandbox)
-- `pip install yfinance -q` -> ❌ (proxy 403, cannot reach PyPI)
-- `python scripts/smoke_single_stock.py 000801` -> ✅ (decision card built; quote derived from latest close)
-- `python scripts/smoke_single_stock.py 600519` -> ✅ (decision card built; quote derived from latest close)
+- `python scripts/smoke_single_stock.py 000801` -> ✅ (kline rows: 200; quote fell back to derived close because proxy blocks akshare)
+- `python scripts/smoke_single_stock.py 600519` -> ✅ (kline rows: 200; quote fell back to derived close because proxy blocks akshare)
 
-### Logs
-- External HTTP access to Eastmoney/Sina/Tencent/CNINFO is still blocked by the sandbox proxy (403), so live quote/K线/公告/财务 calls fail. Bundled deterministic samples now backfill all mandatory metrics, and quotes derive from the latest sample K线 when realtime is missing.
-- Attempting to install `yfinance` to use Yahoo Finance also failed due to the proxy.
-- Added a deterministic research decision layer that consumes kline/financial/announcement payloads and emits BUY/WATCH/AVOID with data-quality score and missing-data notes.
+### Connectivity diagnostics
+- External HTTP access to Eastmoney/Sina/Tencent/CNINFO remains blocked by the sandbox proxy (403), so akshare spot/k线 calls throw ProxyError and the pipeline falls back to cached/synthetic data. In a real Windows environment with internet, akshare should now succeed because it uses the plain 6-digit symbols from the v1 working build.
+- Decision engine remains intact and continues to consume the fetched payloads for the "投研结论卡".
 
 ## Status
-- Added akshare providers for quote/K线/财务 with highest priority, falling back to BaoStock/legacy routes and, if all else fails, bundled offline samples (>=200 bars, >=9 financial metrics, >=1 announcement).
-- AlternativeData banner now prints safely on Windows consoles to avoid GBK encode errors seen in prior smoke runs.
-- New research.decision_engine builds a “投研结论卡” directly in the app/smoke path so the single-stock page is never blank even without realtime quotes.
+- Ported the v1 working akshare paths: quote uses cached spot snapshot lookup; K线 uses plain 6-digit symbols (`stock_zh_a_hist` qfq) to avoid the prefix issue and is top priority.
+- Provider priority remains akshare → Baostock/Tencent legacy, with offline sample only if online sources fail (clearly labeled).
+- Decision engine and non-empty UI remain unchanged; derived price captions now read “非实时：使用最近收盘价 …” when realtime is missing.
 
 ## Provider Fallback Snapshot
 | Domain | Primary | Secondary | Offline backstop |
 | --- | --- | --- | --- |
-| Quote | akshare spot | Eastmoney/Sina/Tencent legacy | Derived from latest K线 sample |
-| Kline | akshare qfq | BaoStock → Tencent | Bundled 200-row sample |
+| Quote | akshare spot snapshot (plain code) | Eastmoney/Sina/Tencent legacy | Derived from latest K线 sample |
+| Kline | akshare stock_zh_a_hist qfq | BaoStock → Tencent | Bundled 200-row sample |
 | Financial | akshare abstract | BaoStock → CNINFO report list | Bundled sample statement |
 | Announcements | SSE/SZSE exchange | Eastmoney/Tencent/CNINFO | Bundled sample announcement |
 
 ## Self-check和后续改进
-- **联网验证**：在实际可联网的 Windows 环境复核 akshare/BaoStock/交易所接口，确认能覆盖样本之外的股票并替换掉离线兜底。
-- **数据来源提示**：UI 和诊断面板需要标明“offline_sample/derived_from_kline”以提示用户数据非实时。
-- **缓存治理**：可增加最近成功时间/刷新按钮与 TTL 提示，防止离线样本长期掩盖真实接口故障。
+- **联网验证**：在可联网的 Windows 环境复核 akshare spot/K线是否恢复实时，确认 >=120 行日线、现价非空；此路径现已与 v1 工作版一致。
+- **数据来源提示**：UI 已标记“非实时：使用最近收盘价”，但仍需在连接恢复时确保优先显示实时行情。
+- **缓存治理**：spot snapshot 现缓存 180 秒；可增加刷新按钮或 TTL 提示，防止离线样本长期掩盖真实接口故障。

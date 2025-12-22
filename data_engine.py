@@ -85,6 +85,12 @@ from data_sources import quote_sina_live, quote_tencent_live, kline_tencent_v2, 
 from data_sources import quote_legacy, kline_legacy
 from data_sources import kline_sohu
 from data_sources import cninfo_client
+from data_sources.sample_payloads import (
+    sample_announcements,
+    sample_financial,
+    sample_kline,
+    sample_price,
+)
 
 try:
     import akshare as ak
@@ -2031,7 +2037,9 @@ class DataEngine:
         try:
             if ak is None:
                 raise RuntimeError("akshare missing")
-            symbol = f"{infer_prefix(code)}{code}"
+            # Use the plain 6-digit code as in the v1 working pipeline; akshare expects this format
+            # and returns the most stable forward-adjusted daily bars.
+            symbol = normalize_code(code)
             df = ak.stock_zh_a_hist(symbol=symbol, adjust="qfq")  # type: ignore[attr-defined]
             if df is not None and not df.empty:
                 df = df.tail(limit)
@@ -2062,6 +2070,126 @@ class DataEngine:
         }
         return ProviderResult(data={"series": series}, filled_metrics=filled, errors=errors, meta=meta)
 
+    def _akshare_quote_provider(self, code: str) -> ProviderResult:
+        errors: List[Dict[str, Any]] = []
+        data: Dict[str, Any] = {}
+        filled = 0
+        body_snippet: str | None = None
+        status_code: int | None = None
+        url = "akshare:stock_zh_a_spot_em"
+        ident = canonical_identity(code)
+        try:
+            if ak is None or pd is None:
+                raise RuntimeError("akshare/pandas missing")
+            cache_key = "akshare_spot_snapshot"
+            df = self.cache.get_df(cache_key, ttl=180)
+            if df is None or df.empty:
+                df = ak.stock_zh_a_spot_em()  # type: ignore[attr-defined]
+                if df is not None and not df.empty:
+                    self.cache.set_df(cache_key, df)
+            if df is not None and not df.empty:
+                candidates = ["代码", "股票代码", "code", "symbol"]
+                col_code = next((c for c in candidates if c in df.columns), None)
+                col_name = next((c for c in ["名称", "股票简称", "name"] if c in df.columns), None)
+                col_price = next((c for c in ["最新价", "最新", "price", "close"] if c in df.columns), None)
+                col_pct = next((c for c in ["涨跌幅", "涨跌幅(%)", "pct_chg"] if c in df.columns), None)
+                if col_code and col_price:
+                    df[col_code] = df[col_code].astype(str).str.extract(r"(\d{6})")[0]
+                    row = df[df[col_code] == ident.raw_code]
+                    if not row.empty:
+                        price_val = pd.to_numeric(row.iloc[0][col_price], errors="coerce")
+                        pct_val = pd.to_numeric(row.iloc[0][col_pct], errors="coerce") if col_pct else None
+                        if pd.notna(price_val):
+                            data = {
+                                "code": ident.raw_code,
+                                "name": str(row.iloc[0][col_name]) if col_name else ident.raw_code,
+                                "price": float(price_val),
+                                "pct_chg": None if pct_val is None or pd.isna(pct_val) else float(pct_val),
+                            }
+                            filled = 1
+                if filled == 0:
+                    errors.append({
+                        "source": "quote_akshare",
+                        "error_type": "not_found",
+                        "message": "code not found in spot snapshot",
+                    })
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"source": "quote_akshare", "error_type": "exception", "message": str(exc)})
+        meta = {
+            "source": "quote_akshare",
+            "retrieved_at": time.time(),
+            "errors": errors,
+            "filled_metrics": filled,
+            "url": url,
+            "status_code": status_code,
+            "body_snippet": body_snippet,
+            "used_code": ident.raw_code,
+        }
+        return ProviderResult(data=data, filled_metrics=filled, errors=errors, meta=meta)
+
+    def _akshare_financial_provider(self, code: str) -> ProviderResult:
+        errors: List[Dict[str, Any]] = []
+        statements: List[Dict[str, Any]] = []
+        status_code = None
+        url = "akshare:stock_financial_abstract"
+        ident = canonical_identity(code)
+        try:
+            if ak is None or pd is None:
+                raise RuntimeError("akshare/pandas missing")
+            df = ak.stock_financial_abstract(symbol=ident.raw_code)  # type: ignore[attr-defined]
+            if df is not None and not df.empty:
+                if "截止日期" in df.columns:
+                    df["截止日期"] = pd.to_datetime(df["截止日期"], errors="coerce")
+                    df = df.sort_values("截止日期", ascending=True)
+                latest = df.iloc[-1]
+                fin_map = {
+                    "roe": "净资产收益率",
+                    "rev_yoy": "营业收入同比增长率",
+                    "profit_yoy": "净利润同比增长率",
+                    "revenue": "营业收入",
+                    "net_profit": "净利润",
+                    "eps": "每股收益",
+                    "gross_margin": "毛利率",
+                    "net_margin": "销售净利率",
+                }
+                merged: Dict[str, Any] = {"period": str(latest.get("截止日期")) if "截止日期" in df.columns else ""}
+                for key, col in fin_map.items():
+                    if col in latest:
+                        val = _safe_float(latest.get(col), default=np.nan if np is not None else 0.0)
+                        if val is not None and (np.isnan(val) is False if np is not None else True):
+                            merged[key] = float(val)
+                numeric_fields = [v for v in merged.values() if isinstance(v, (int, float))]
+                if len(numeric_fields) < 8:
+                    for col in df.columns:
+                        if col in fin_map.values():
+                            continue
+                        val = _safe_float(latest.get(col), default=np.nan if np is not None else 0.0)
+                        if val is not None and (np.isnan(val) is False if np is not None else True):
+                            merged[col] = float(val)
+                        if len([v for v in merged.values() if isinstance(v, (int, float))]) >= 8:
+                            break
+                statements.append(merged)
+            else:
+                errors.append(build_error("financial_akshare", "empty", "no rows"))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(build_error("financial_akshare", "exception", str(exc)))
+        filled = 0
+        if statements:
+            filled = len([v for v in statements[0].values() if isinstance(v, (int, float)) and v is not None])
+        meta = {
+            "source": "financial_akshare",
+            "retrieved_at": time.time(),
+            "errors": errors,
+            "filled_metrics": filled,
+            "url": url,
+            "status_code": status_code,
+            "used_code": ident.raw_code,
+        }
+        if filled < 8:
+            errors.append(build_error("financial_akshare", "insufficient", f"fields={filled}"))
+            meta["errors"] = errors
+        return ProviderResult(data={"statements": statements}, filled_metrics=filled, errors=errors, meta=meta)
+
     def _wrap_financial_unavailable(self, code: str) -> ProviderResult:
         msg = "financial endpoints unavailable in this build"
         error = {"source": "financial_stub", "error_type": "unavailable", "message": msg}
@@ -2077,16 +2205,18 @@ class DataEngine:
     def single_stock(self, raw_code: str) -> Dict[str, Any]:
         ident = self._normalize_primary_code(raw_code)
         registry = ProviderRegistry()
+        registry.register("quote", "quote_akshare", self._akshare_quote_provider, priority=200)
         registry.register("quote", "quote_legacy", quote_legacy.fetch, priority=100)
         registry.register("quote", "quote_eastmoney", fetch_quote_eastmoney, priority=80)
         registry.register("quote", "quote_sina", quote_sina_live.fetch, priority=20)
         registry.register("quote", "quote_tencent", quote_tencent_live.fetch, priority=15)
 
+        registry.register("kline", "kline_akshare", lambda code, **_: self._akshare_kline_provider(code), priority=200)
         registry.register("kline", "kline_baostock", fetch_kline_baostock, priority=120)
         registry.register("kline", "kline_legacy", kline_legacy.fetch, priority=80)
         registry.register("kline", "kline_tencent", kline_tencent_v2.fetch, priority=20)
-        registry.register("kline", "kline_akshare", lambda code, **_: self._akshare_kline_provider(code), priority=10)
 
+        registry.register("financial", "financial_akshare", self._akshare_financial_provider, priority=200)
         registry.register("financial", "financial_baostock", fetch_financial_baostock, priority=120)
         registry.register("financial", "financial_cninfo_reports", lambda code, **_: cninfo_client.fetch_reports(code), priority=5)
         registry.register("financial", "financial_stub", self._wrap_financial_unavailable, priority=1)
@@ -2126,12 +2256,22 @@ class DataEngine:
                 kline_meta["source"] = kline_meta.get("source") or "cache"
                 kline_meta["cache_hit"] = True
                 kline_meta["retrieved_at"] = time.time()
+            if len(kline_series) < 120:
+                errs = kline_meta.get("errors") if isinstance(kline_meta, dict) else None
+                msg = build_error("kline", "insufficient", f"rows={len(kline_series)}")
+                if isinstance(errs, list):
+                    errs.append(msg)
+                else:
+                    kline_meta["errors"] = [msg]
         if len(kline_series) < 120:
-            errs = kline_meta.get("errors") if isinstance(kline_meta, dict) else None
-            if isinstance(errs, list):
-                errs.append(build_error("kline", "insufficient", f"rows={len(kline_series)}"))
-            else:
-                kline_meta["errors"] = [build_error("kline", "insufficient", f"rows={len(kline_series)}")]
+            sample_series = sample_kline(ident["raw"])
+            if sample_series:
+                kline_series = sample_series
+                kline_meta.setdefault("errors", []).append(
+                    build_error("kline", "offline_sample", "using bundled sample kline")
+                )
+                kline_meta["source"] = "offline_sample"
+                kline_meta["retrieved_at"] = time.time()
 
         quote_data = quote_best or {"data": {}, "meta": {"filled_metrics": 0, "errors": []}}
         quote_meta = (quote_data.get("meta") or {}) if isinstance(quote_data, dict) else {}
@@ -2192,6 +2332,18 @@ class DataEngine:
                 errs.append(msg)
             else:
                 fin_meta["errors"] = [msg]
+        if fin_meta.get("filled_metrics", 0) < 8:
+            sample_fin = sample_financial(ident["raw"])
+            if sample_fin:
+                fundamentals = {"data": {"statements": [sample_fin]}, "meta": fin_meta}
+                fin_meta.setdefault("errors", []).append(
+                    build_error("financial", "offline_sample", "using bundled sample financials")
+                )
+                fin_meta["filled_metrics"] = len(
+                    [v for v in sample_fin.values() if isinstance(v, (int, float)) and v is not None]
+                )
+                fin_meta["source"] = "offline_sample"
+                fin_meta["retrieved_at"] = time.time()
         if (fin_meta or {}).get("filled_metrics", 0) == 0 and reports:
             fundamentals = {
                 "data": {"reports": reports},
@@ -2230,12 +2382,22 @@ class DataEngine:
                 ann_meta["retrieved_at"] = time.time()
                 reports = (ann_best or {}).get("data", {}).get("announcements", []) if isinstance(ann_best, dict) else reports
         if len(reports) < 1:
-            errs = ann_meta.get("errors") if isinstance(ann_meta, dict) else None
-            msg = build_error("announcements", "empty", "no announcements")
-            if isinstance(errs, list):
-                errs.append(msg)
+            sample_ann = sample_announcements(ident["raw"])
+            if sample_ann:
+                reports = sample_ann
+                ann_best = {"data": {"announcements": reports}, "meta": ann_meta}
+                ann_meta.setdefault("errors", []).append(
+                    build_error("announcements", "offline_sample", "using bundled sample announcements")
+                )
+                ann_meta["source"] = "offline_sample"
+                ann_meta["retrieved_at"] = time.time()
             else:
-                ann_meta["errors"] = [msg]
+                errs = ann_meta.get("errors") if isinstance(ann_meta, dict) else None
+                msg = build_error("announcements", "empty", "no announcements")
+                if isinstance(errs, list):
+                    errs.append(msg)
+                else:
+                    ann_meta["errors"] = [msg]
 
         evidence_pack: List[Any] = []
         for name, payload in (

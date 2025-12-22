@@ -126,6 +126,92 @@ def normalize_code(code: str) -> str:
 standardize_code = normalize_code
 
 
+def normalize_single_stock_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten single_stock output into UI-friendly keys.
+
+    The Streamlit layer expects direct fields (price, pct, etc.) instead of
+    nested {data, meta} blobs. This helper preserves originals while exposing
+    normalized accessors so the UI never renders blanks when data exists.
+    """
+
+    def _as_dict(obj: Any) -> Dict[str, Any]:
+        return obj if isinstance(obj, dict) else {}
+
+    res = payload or {}
+    meta_map = _as_dict(res.get("_meta"))
+
+    quote_obj = _as_dict(res.get("quote"))
+    quote_data = _as_dict(quote_obj.get("data"))
+    quote_meta = _as_dict(quote_obj.get("meta")) or _as_dict(meta_map.get("quote"))
+
+    kline_obj = _as_dict(res.get("kline"))
+    kline_meta = _as_dict(kline_obj.get("meta")) or _as_dict(meta_map.get("kline"))
+    kline_daily = kline_obj.get("daily") or _as_dict(kline_obj.get("data")).get("series") or []
+
+    pd_available = pd is not None
+    kline_df = None
+    if kline_daily and pd_available:
+        try:
+            tmp = pd.DataFrame(kline_daily)
+            col_map = {col.lower(): col for col in tmp.columns}
+            for src, tgt in [("time", "date"), ("tradedate", "date"), ("vol", "volume")]:
+                if src in col_map and tgt not in tmp.columns:
+                    tmp[tgt] = tmp[col_map[src]]
+            numeric_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in tmp.columns]
+            for c in numeric_cols:
+                tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
+            if "date" in tmp.columns:
+                try:
+                    tmp = tmp.sort_values("date")
+                except Exception:
+                    pass
+            kline_df = tmp
+            kline_meta.setdefault("filled_metrics", len(tmp))
+        except Exception:
+            kline_df = None
+
+    fin_obj = _as_dict(res.get("financial"))
+    fin_meta = _as_dict(fin_obj.get("meta")) or _as_dict(meta_map.get("financial"))
+    fin_data = _as_dict(fin_obj.get("data"))
+    statements = fin_data.get("statements") or fin_data.get("reports") or []
+    fin_flat: Dict[str, Any] = {}
+    if isinstance(statements, list) and statements:
+        first = statements[0]
+        if isinstance(first, dict):
+            fin_flat = first
+    elif fin_data:
+        fin_flat = {k: v for k, v in fin_data.items() if not isinstance(v, (list, dict))}
+
+    ann_obj = _as_dict(res.get("announcements"))
+    ann_meta = _as_dict(ann_obj.get("meta")) or _as_dict(meta_map.get("announcements"))
+    ann_data = _as_dict(ann_obj.get("data"))
+    ann_list = ann_data.get("announcements") or ann_obj.get("announcements") or []
+
+    provider_trace = _as_dict(res.get("provider_trace"))
+
+    normalized = {
+        **res,
+        "market_data": quote_data,
+        "quote_meta": quote_meta,
+        "kline_daily": kline_daily,
+        "kline_daily_df": kline_df,
+        "kline_meta": kline_meta,
+        "financials": fin_flat,
+        "financial_meta": fin_meta,
+        "announcements": ann_list,
+        "announcements_meta": ann_meta,
+        "provider_trace": provider_trace,
+        "_meta": {
+            **meta_map,
+            "quote": quote_meta,
+            "kline": kline_meta,
+            "financial": fin_meta,
+            "announcements": ann_meta,
+        },
+    }
+    return normalized
+
+
 def to_tushare_ts_code(raw_code: str) -> str:
     ident = canonical_identity(raw_code)
     return ident.symbol

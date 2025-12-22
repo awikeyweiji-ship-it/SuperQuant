@@ -23,7 +23,7 @@ from plotly.subplots import make_subplots
 
 # 引入核心组件
 from universe_cache import UniverseCache
-from data_engine import DataEngine, normalize_code, standardize_code
+from data_engine import DataEngine, normalize_code, normalize_single_stock_payload, standardize_code
 from tools.connectivity_doctor_v2 import probe_endpoints
 from market_scanner import MarketScanner, ScanConfig
 from deep_search_agent import DeepSearchAgent
@@ -341,10 +341,7 @@ def _safe_holistic(engine, code: str):
     code_std = standardize_code(code)
     try:
         res = engine.single_stock(code_std)
-        meta = res.get("_meta") if isinstance(res, dict) else {}
-        res["_meta"] = meta if isinstance(meta, dict) else {}
-        res["market_data"] = res.get("quote", {})
-        res["financials"] = res.get("financial", {})
+        res = normalize_single_stock_payload(res)
         res["money_flow"] = res.get("money_flow", {})
         return res
     except Exception as e:  # noqa: BLE001
@@ -868,6 +865,18 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                     st.markdown(f"**{label}错误详情:**")
                     _render_errors(meta.get("errors"))
 
+        with st.expander("🐞 调试/原始数据", expanded=False):
+            st.caption("single_stock payload (normalized)")
+            try:
+                st.json({k: v for k, v in dp.items() if k != "provider_trace"})
+            except Exception:
+                st.json(str(dp))
+            st.caption("provider_trace")
+            try:
+                st.json(dp.get("provider_trace"))
+            except Exception:
+                st.write("provider_trace unavailable")
+
         # 2. 分页展示 (Tabs)
         tab_dash, tab_kline, tab_logic, tab_fund = st.tabs(["📊 战术看板", "📈 K线图表", "🧠 逻辑拆解", "💰 财务/资金"])
 
@@ -930,7 +939,29 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             st.caption("支持滚轮缩放与拖拽")
             col_k1, col_k2, col_k3 = st.columns(3)
             kline_code = dp.get('code') or code_input
-            if not kline_code:
+            kline_df = dp.get("kline_daily_df") if _get_pandas() is not None else None
+            if kline_df is not None and hasattr(kline_df, "empty") and not kline_df.empty:
+                try:
+                    df_plot = kline_df.copy().tail(240)
+                    for target in [col_k1, col_k2, col_k3]:
+                        with target:
+                            plot_df = df_plot if target is col_k1 else df_plot
+                            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+                            fig.add_trace(go.Candlestick(
+                                x=plot_df['date'], open=plot_df['open'], high=plot_df['high'], low=plot_df['low'], close=plot_df['close'],
+                                name='K线', increasing_line_color='#eb5353', decreasing_line_color='#3bceac'
+                            ), row=1, col=1)
+                            ma5 = plot_df['close'].rolling(5).mean()
+                            ma20 = plot_df['close'].rolling(20).mean()
+                            fig.add_trace(go.Scatter(x=plot_df['date'], y=ma5, line=dict(color='orange', width=1), name='MA5'), row=1, col=1)
+                            fig.add_trace(go.Scatter(x=plot_df['date'], y=ma20, line=dict(color='#4e8cff', width=1), name='MA20'), row=1, col=1)
+                            colors = ['#eb5353' if r.close >= r.open else '#3bceac' for _, r in plot_df.iterrows()]
+                            fig.add_trace(go.Bar(x=plot_df['date'], y=plot_df['volume'], marker_color=colors, name='成交量'), row=2, col=1)
+                            fig.update_layout(xaxis_rangeslider_visible=False, height=500, margin=dict(l=10, r=10, t=30, b=10), template="plotly_white")
+                            st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    plot_kline(kline_code, 'daily', "日线 (Daily)")
+            elif not kline_code:
                 st.warning("暂无代码，无法绘制 K 线")
             else:
                 with col_k1:
@@ -969,6 +1000,24 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
 
             st.divider()
             st.markdown("#### 📡 情报流 (公告 / 研报 / 热点 / 论坛)")
+            ann_list = dp.get("announcements") or []
+            ann_trace = (_as_dict(dp.get("provider_trace")) or {}).get("announcements") or []
+            ann_errors = []
+            for tr in ann_trace:
+                ann_errors.extend(_as_dict(tr).get("errors", []))
+            if ann_list:
+                st.markdown(f"**公告 ({len(ann_list)})**")
+                pd = _get_pandas()
+                if pd is not None:
+                    df_ann = pd.DataFrame(ann_list)
+                    cols = [c for c in ["title", "time", "source", "url"] if c in df_ann.columns]
+                    _safe_dataframe(df_ann[cols] if cols else df_ann, width="stretch")
+                else:
+                    st.table(ann_list)
+            else:
+                st.info("暂无公告/公告抓取失败")
+                if ann_errors:
+                    _render_errors(ann_errors)
             nb = news_bundle if isinstance(news_bundle, dict) else {}
             for key, label in [
                 ("announcements", "公告"),
@@ -1001,6 +1050,11 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
             c_f3.metric("利润增长", _fmt_val(fin.get('profit_yoy'), suffix="%"))
             c_f4.metric("营收增长", _fmt_val(fin.get('revenue_yoy'), suffix="%"))
             st.write(f"报告期: {_fmt_val(fin.get('report_date'))}")
+            pd = _get_pandas()
+            if pd is not None and fin:
+                df_fin = pd.DataFrame([fin]).T.reset_index()
+                df_fin.columns = ["字段", "值"]
+                _safe_dataframe(df_fin, width="stretch")
             _render_meta(fin_meta)
             if not (fin_meta or {}).get("ok"):
                 _render_errors((fin_meta or {}).get("errors"))

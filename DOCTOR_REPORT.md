@@ -1,25 +1,27 @@
 # Doctor Report
 
-Generated: 2025-02-19T00:00:00Z (sandbox refresh with akshare spot/kline restored)
+Generated: 2025-02-19T00:00:00Z (sandbox refresh with UI normalization + debug expander)
 
 ## Environment
 - Python: 3.11.12
 - Platform: Linux (sandbox)
 
 ## Commands Executed (sandbox)
-- `python scripts/smoke_single_stock.py 601872` -> ⚠️ blocked by proxy (all public endpoints 403; baostock login failure). Parser now reports provider errors without crashing.
-- `python scripts/smoke_single_stock.py 000801` -> ⚠️ blocked by proxy (k线/quote 403; announcements fell back to sample). Offline sample labeled in provider trace.
+- `python -m compileall .` -> ✅ completes (very slow due to full site-packages scan).
+- `python scripts/smoke_single_stock.py 601872` -> ❌ proxy 403 on quote/k线/announcement; baostock login fails; smoke reports errors but exits cleanly (no WinError 10038).
+- `python scripts/smoke_single_stock.py 000801` -> ⚠️ proxy 403 so quote/k线 fall back to derived/sample; announcements use labeled sample; smoke finishes without exceptions.
+- `streamlit run app.py --server.headless true --server.port 8501` (timeout 20s) -> ✅ launches and renders headless; terminated manually after startup.
 
 ### Connectivity diagnostics
-- Tencent k线 parser now accepts multiple symbol keys (sh/sz/plain) and qfq/day/daily lists; HTML bodies are flagged as `blocked_html` instead of causing empty rows.
-- Exchange / cninfo / Eastmoney announcement fetchers now send UA/Referer headers and return empty lists on HTML/404 so `NoneType.get` crashes are avoided; fallback traces capture the blocking reason.
-- Baostock logout is guarded with a sentinel to avoid duplicated socket closes (WinError 10038).
-- Sandbox proxy still returns 403 to all external hosts; on a real Windows network the primary Tencent k线/quote paths should populate >=120 rows and a non-blank price.
+- Tencent k线 parser accepts sh/sz/plain symbols and qfq/day/daily keys; HTML bodies flagged as `blocked_html`. When reachable it returns numeric bars into the normalized payload so Streamlit tabs render immediately.
+- Announcement fetchers return [] with explicit errors on HTML/404 and now set UA/Referer headers; provider_trace errors surface in the new debug expander instead of crashing the page.
+- Baostock logout still guarded; Broken pipe warnings from the proxy do not bubble into WinError 10038.
+- Sandbox proxy returns 403 to all external hosts, so realtime quote/k线 stay empty here. On a real Windows network the restored Tencent/baostock paths should fill >=120 rows and non-blank price.
 
 ## Status
-- Restored the Tencent fqkline primary path with robust key detection and numeric parsing so real rows are kept when the endpoint responds with JSON.
-- Added announcement hardening (headers + safe fallbacks) and guarded baostock logout to prevent WinError 10038.
-- UI shows quote source badge and still labels derived closes as “非实时：使用最近收盘价 …” when realtime quotes are missing.
+- Normalized `single_stock` payloads (quote/k线/财务/公告) for Streamlit so “现价” and charts read the real fields instead of nested blobs; added a debug expander that prints the raw payload + provider_trace for on-screen triage.
+- K线 tab now prefers the fetched daily bars (DataFrame if available) and renders MA/volume charts without re-fetching.
+- Announcement empty states no longer blank the page; errors are shown inline and metrics remain visible.
 
 ## Provider Fallback Snapshot
 | Domain | Primary | Secondary | Offline backstop |

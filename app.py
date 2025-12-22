@@ -31,6 +31,7 @@ from radiation_engine import RadiationEngine
 from signal_fuser import SignalFuser
 from slow_factor_engine import SlowFactorEngine
 from paper_portfolio import simulate_paper_portfolio
+from research.decision_engine import build_decision
 import ai_advisor
 from logging_utils import FetchResult, build_error, make_result
 
@@ -753,11 +754,51 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         c_h1.metric("现价", _fmt_val(close_for_display), pct_delta)
         if derived_close is not None:
             latest_date = derived_date or "未知"
-            c_h1.caption(f"(非实时：最新收盘价 {latest_date})")
+            c_h1.caption(f"非实时：使用最近收盘价 {latest_date}")
         c_h2.metric("AI 综合评分", _fmt_val(rep.get('ai_score')))
         st.caption(
             f"行情源: {quote_meta.get('source') or '-'} | K线源: {kline_meta.get('source') or '-'} | 财报源: {fin_meta.get('source') or '-'} | 公告源: {ann_meta.get('source') or '-'}"
         )
+
+        # deterministic 投研结论卡
+        try:
+            decision_bundle = build_decision(dp)
+        except Exception:
+            decision_bundle = {}
+        decision_card = decision_bundle.get("decision_card", {}) if isinstance(decision_bundle, dict) else {}
+        st.markdown("### 🧭 投研结论卡")
+        c_dec1, c_dec2, c_dec3, c_dec4 = st.columns([1.4, 1, 1, 1])
+        verdict = decision_card.get("verdict", "WATCH")
+        horizon = decision_card.get("horizon", "1m")
+        dq_score = decision_card.get("data_quality_score", 0)
+        position_pct = decision_card.get("position_sizing_pct", 0)
+        c_dec1.metric("结论", verdict)
+        c_dec2.metric("持有周期", horizon)
+        c_dec3.metric("数据质量", f"{dq_score}/100")
+        c_dec4.metric("建议仓位", f"{position_pct}%")
+
+        def _render_bullets(label: str, items):
+            st.markdown(f"**{label}**")
+            if not items:
+                st.caption("insufficient evidence")
+                return
+            for it in items:
+                st.markdown(f"- {it}")
+
+        _render_bullets("核心论据", decision_card.get("thesis", []))
+        _render_bullets("关键风险", decision_card.get("risks", []))
+        _render_bullets("触发条件", decision_card.get("triggers", []))
+        _render_bullets("反证清单", decision_card.get("disconfirming_checklist", []))
+
+        with st.expander("数据质量与缺口"):
+            missing_notes = decision_card.get("missing_notes", []) or ["无"]
+            for note in missing_notes:
+                st.markdown(f"- {note}")
+            ev_map = decision_card.get("evidence_map") or {}
+            if ev_map:
+                st.caption("证据索引")
+                for key, val in ev_map.items():
+                    st.text(f"{key}: {val.get('summary')}")
 
         # 决策高亮
         decision = rep.get('decision', '观望')
@@ -838,7 +879,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                     derived_px, derived_dt = _extract_latest_close(dp.get('kline_daily') or dp.get('kline'))
                     price = derived_px
                     if derived_px is not None:
-                        st.caption(f"(非实时：最新收盘价 {derived_dt or '未知'})")
+                        st.caption(f"(非实时：使用最近收盘价 {derived_dt or '未知'})")
                 st.metric("现价", price if price is not None else "-", f"{pct}%" if pct is not None else None)
                 st.write(f"成交额: {md.get('amount') or '-'} | 量比: {md.get('vol_ratio') or '-'}")
                 st.caption(

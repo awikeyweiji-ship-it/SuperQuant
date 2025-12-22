@@ -68,9 +68,17 @@ TRASH_WORDS = {
     "违法", "不良信息", "友情链接", "反诈", "警方", "市民", "劝阻", "防范"
 }
 
+def _safe_banner(msg: str) -> None:
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        # Windows 默认控制台为 gbk，直接打印 emoji 会抛异常，忽略不可编码字符后输出
+        print(msg.encode("utf-8", "ignore").decode("utf-8", "ignore"))
+
+
 class AlternativeDataEngine:
     def __init__(self, cache: UniverseCache | None = None):
-        print("🕵️ [情报局 V9.1] 启动 (天网情报系统已修复)...")
+        _safe_banner("🕵️ [情报局 V9.1] 启动 (天网情报系统已修复)...")
         self.macro_cache = {}
         self.cache = cache or UniverseCache()
         self.sentiment_ttl = 60 * 30

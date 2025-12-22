@@ -1,0 +1,5 @@
+python -c "import sys; print(sys.executable); import pkgutil; print('baostock' in [m.name for m in pkgutil.iter_modules()])" > _local_env.txt
+
+python scripts\smoke_single_stock.py 000801 > _smoke_000801.txt 2>&1
+
+python -c "from data_engine import DataEngine; import json; print(json.dumps(DataEngine().single_stock('000801'), ensure_ascii=False)[:2000])" > _single_stock_head_000801.txt 2>&1

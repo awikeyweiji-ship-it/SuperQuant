@@ -18,6 +18,7 @@ class Identity:
     symbol: str
     prefixed: str
     secid: str
+    baostock_code: str
 
     def to_dict(self) -> Dict[str, str]:
         return asdict(self)
@@ -42,5 +43,6 @@ def canonical_identity(raw_code: str) -> Identity:
     if exch == "SH":
         secid_prefix = "1"
     secid = f"{secid_prefix}.{code}"
-    return Identity(raw_code=code, exchange=exch, symbol=symbol, prefixed=pref, secid=secid)
+    baostock_code = f"{exch.lower()}.{code}"
+    return Identity(raw_code=code, exchange=exch, symbol=symbol, prefixed=pref, secid=secid, baostock_code=baostock_code)
 

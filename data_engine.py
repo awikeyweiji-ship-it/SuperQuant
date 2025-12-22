@@ -2078,6 +2078,7 @@ class DataEngine:
         ident = self._normalize_primary_code(raw_code)
         registry = ProviderRegistry()
         registry.register("quote", "quote_legacy", quote_legacy.fetch, priority=100)
+        registry.register("quote", "quote_eastmoney", fetch_quote_eastmoney, priority=80)
         registry.register("quote", "quote_sina", quote_sina_live.fetch, priority=20)
         registry.register("quote", "quote_tencent", quote_tencent_live.fetch, priority=15)
 
@@ -2116,27 +2117,37 @@ class DataEngine:
 
         quote_data = quote_best or {"data": {}, "meta": {"filled_metrics": 0, "errors": []}}
         quote_meta = (quote_data.get("meta") or {}) if isinstance(quote_data, dict) else {}
-        if (quote_meta or {}).get("filled_metrics", 0) == 0 and kline_series:
+        quote_payload = quote_data.get("data", {}) if isinstance(quote_data, dict) else {}
+        price_val = _to_float_or_none(quote_payload.get("price") or quote_payload.get("close"))
+        if price_val is not None:
+            quote_payload["price"] = price_val
+            quote_data["data"] = quote_payload
+
+        if price_val is None and kline_series:
             last = kline_series[-1]
-            quote_data = {
-                "data": {
-                    "code": ident["raw"],
-                    "name": ident["raw"],
-                    "price": last.get("close"),
-                    "pct_chg": None,
-                    "time": last.get("date"),
-                },
-                "meta": {
-                    "source": "derived_from_kline",
-                    "retrieved_at": time.time(),
-                    "filled_metrics": 1,
-                    "errors": [{"source": "quote", "error_type": "derived", "message": "realtime quote missing, using latest close"}],
-                    "is_derived": True,
-                    "latest_price_non_realtime": True,
-                    "source_kline": kline_meta.get("source"),
-                },
-            }
-            quote_meta = quote_data["meta"]
+            derived_price = _to_float_or_none(last.get("close"))
+            if derived_price is not None:
+                quote_data = {
+                    "data": {
+                        "code": ident["raw"],
+                        "name": quote_payload.get("name") or ident["raw"],
+                        "price": derived_price,
+                        "pct_chg": quote_payload.get("pct_chg"),
+                        "time": last.get("date"),
+                    },
+                    "meta": {
+                        **quote_meta,
+                        "source": quote_meta.get("source") or "derived_from_kline",
+                        "retrieved_at": time.time(),
+                        "filled_metrics": max(1, quote_meta.get("filled_metrics", 0)),
+                        "errors": (quote_meta.get("errors") or [])
+                        + [{"source": "quote", "error_type": "derived", "message": "realtime quote missing, using latest close"}],
+                        "is_derived": True,
+                        "latest_price_non_realtime": True,
+                        "source_kline": kline_meta.get("source"),
+                    },
+                }
+                quote_meta = quote_data["meta"]
         else:
             quote_meta = quote_data.get("meta", {}) if isinstance(quote_data, dict) else {}
             quote_meta["is_derived"] = False if quote_meta else False

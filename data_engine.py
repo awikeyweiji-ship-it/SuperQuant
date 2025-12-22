@@ -56,8 +56,10 @@ from data_sources import (
 from data_sources.quote_eastmoney import fetch as fetch_quote_eastmoney
 from data_sources.quote_sina import fetch as fetch_quote_sina
 from data_sources.kline_tencent import fetch as fetch_kline_tencent
+from data_sources.kline_baostock import fetch as fetch_kline_baostock
 from data_sources.financial_eastmoney import fetch as fetch_financial_eastmoney
 from data_sources.financial_em_basic import fetch as fetch_financial_em_basic
+from data_sources.financial_baostock import fetch as fetch_financial_baostock
 from data_sources.moneyflow_eastmoney import fetch as fetch_moneyflow_eastmoney
 from data_sources.identity_eastmoney import fetch_identity_em
 from data_sources.news_announcements_eastmoney import fetch as fetch_news_announcements
@@ -70,6 +72,7 @@ from data_sources.announcement_eastmoney import (
     fetch_announcements_tencent,
     sample_announcements,
 )
+from data_sources.announcements_eastmoney import fetch as fetch_announcements_eastmoney
 from data_sources.announcements_cninfo import fetch as fetch_announcements_cninfo
 from data_sources.report_eastmoney import (
     fetch_research_reports_em,
@@ -79,6 +82,7 @@ from data_sources.report_eastmoney import (
 from data_sources.hot_eastmoney import fetch_hot_topics_em, fetch_hot_topics_ak, sample_hot_topics
 from data_sources.quote_sina_live import infer_prefix
 from data_sources import quote_sina_live, quote_tencent_live, kline_tencent_v2, news_sina_stock
+from data_sources import quote_legacy, kline_legacy
 from data_sources import kline_sohu
 from data_sources import cninfo_client
 
@@ -2073,53 +2077,93 @@ class DataEngine:
     def single_stock(self, raw_code: str) -> Dict[str, Any]:
         ident = self._normalize_primary_code(raw_code)
         registry = ProviderRegistry()
+        registry.register("quote", "quote_legacy", quote_legacy.fetch, priority=100)
+        registry.register("quote", "quote_eastmoney", fetch_quote_eastmoney, priority=80)
         registry.register("quote", "quote_sina", quote_sina_live.fetch, priority=20)
         registry.register("quote", "quote_tencent", quote_tencent_live.fetch, priority=15)
 
-        registry.register("kline", "kline_akshare", lambda code, **_: self._akshare_kline_provider(code), priority=25)
+        registry.register("kline", "kline_legacy", kline_legacy.fetch, priority=100)
+        registry.register("kline", "kline_baostock", fetch_kline_baostock, priority=60)
         registry.register("kline", "kline_tencent", kline_tencent_v2.fetch, priority=20)
-        registry.register("kline", "kline_sohu", kline_sohu.fetch, priority=10)
+        registry.register("kline", "kline_akshare", lambda code, **_: self._akshare_kline_provider(code), priority=10)
 
-        registry.register("financial", "financial_cninfo_reports", lambda code, **_: cninfo_client.fetch_reports(code), priority=20)
+        registry.register("financial", "financial_baostock", fetch_financial_baostock, priority=60)
+        registry.register("financial", "financial_cninfo_reports", lambda code, **_: cninfo_client.fetch_reports(code), priority=5)
         registry.register("financial", "financial_stub", self._wrap_financial_unavailable, priority=1)
 
-        registry.register("announcements", "cninfo_ann", lambda code, **_: cninfo_client.fetch_announcements(code, page_size=50), priority=20)
+        registry.register("announcements", "ann_eastmoney", fetch_announcements_eastmoney, priority=60)
+        registry.register("announcements", "cninfo_ann", lambda code, **_: cninfo_client.fetch_announcements(code, page_size=50), priority=10)
+        registry.register("announcements", "ann_cninfo_direct", fetch_announcements_cninfo, priority=5)
         registry.register("news_bundle", "news_sina_stock", news_sina_stock.fetch, priority=10)
 
         quote_best, quote_trace = run_providers_parallel(registry.get_providers("quote"), ident["raw"], timeout=10)
         kline_best, kline_trace = run_providers_parallel(registry.get_providers("kline"), ident["raw"], timeout=12)
-        financial_best, financial_trace = run_providers_parallel(registry.get_providers("financial"), ident["raw"], timeout=6)
+        financial_best, financial_trace = run_providers_parallel(registry.get_providers("financial"), ident["raw"], timeout=8)
         ann_best, ann_trace = run_providers_parallel(registry.get_providers("announcements"), ident["raw"], timeout=10)
         news_best, news_trace = run_providers_parallel(registry.get_providers("news_bundle"), ident["raw"], timeout=10)
 
         kline_series = []
+        kline_meta = {}
         if isinstance(kline_best, dict):
             kline_series = (kline_best.get("data") or {}).get("series", []) if isinstance(kline_best.get("data"), dict) else []
+            kline_meta = kline_best.get("meta", {}) or {}
         kline_series = sorted(kline_series, key=lambda x: x.get("date")) if kline_series else []
+        if len(kline_series) < 120:
+            errs = kline_meta.get("errors") if isinstance(kline_meta, dict) else None
+            if isinstance(errs, list):
+                errs.append(build_error("kline", "insufficient", f"rows={len(kline_series)}"))
+            else:
+                kline_meta["errors"] = [build_error("kline", "insufficient", f"rows={len(kline_series)}")]
 
         quote_data = quote_best or {"data": {}, "meta": {"filled_metrics": 0, "errors": []}}
-        if (quote_data.get("meta") or {}).get("filled_metrics", 0) == 0 and kline_series:
+        quote_meta = (quote_data.get("meta") or {}) if isinstance(quote_data, dict) else {}
+        quote_payload = quote_data.get("data", {}) if isinstance(quote_data, dict) else {}
+        price_val = _to_float_or_none(quote_payload.get("price") or quote_payload.get("close"))
+        if price_val is not None:
+            quote_payload["price"] = price_val
+            quote_data["data"] = quote_payload
+
+        if price_val is None and kline_series:
             last = kline_series[-1]
-            quote_data = {
-                "data": {
-                    "code": ident["raw"],
-                    "name": ident["raw"],
-                    "price": last.get("close"),
-                    "pct_chg": None,
-                    "time": last.get("date"),
-                    "derived": True,
-                },
-                "meta": {
-                    "source": "derived_from_kline",
-                    "retrieved_at": time.time(),
-                    "filled_metrics": 1,
-                    "errors": [{"source": "quote", "error_type": "derived", "message": "realtime quote missing, using latest close"}],
-                },
-            }
+            derived_price = _to_float_or_none(last.get("close"))
+            if derived_price is not None:
+                quote_data = {
+                    "data": {
+                        "code": ident["raw"],
+                        "name": quote_payload.get("name") or ident["raw"],
+                        "price": derived_price,
+                        "pct_chg": quote_payload.get("pct_chg"),
+                        "time": last.get("date"),
+                    },
+                    "meta": {
+                        **quote_meta,
+                        "source": quote_meta.get("source") or "derived_from_kline",
+                        "retrieved_at": time.time(),
+                        "filled_metrics": max(1, quote_meta.get("filled_metrics", 0)),
+                        "errors": (quote_meta.get("errors") or [])
+                        + [{"source": "quote", "error_type": "derived", "message": "realtime quote missing, using latest close"}],
+                        "is_derived": True,
+                        "latest_price_non_realtime": True,
+                        "source_kline": kline_meta.get("source"),
+                    },
+                }
+                quote_meta = quote_data["meta"]
+        else:
+            quote_meta = quote_data.get("meta", {}) if isinstance(quote_data, dict) else {}
+            quote_meta["is_derived"] = False if quote_meta else False
+            quote_meta.setdefault("latest_price_non_realtime", False)
 
         fundamentals = financial_best or {"data": {}, "meta": {"filled_metrics": 0, "errors": []}}
+        fin_meta = fundamentals.get("meta", {}) if isinstance(fundamentals, dict) else {}
         reports = (ann_best or {}).get("data", {}).get("announcements", []) if isinstance(ann_best, dict) else []
-        if (fundamentals.get("meta") or {}).get("filled_metrics", 0) == 0 and reports:
+        if fin_meta.get("filled_metrics", 0) < 8:
+            errs = fin_meta.get("errors") if isinstance(fin_meta, dict) else None
+            msg = build_error("financial", "insufficient", f"fields={fin_meta.get('filled_metrics', 0)}")
+            if isinstance(errs, list):
+                errs.append(msg)
+            else:
+                fin_meta["errors"] = [msg]
+        if (fin_meta or {}).get("filled_metrics", 0) == 0 and reports:
             fundamentals = {
                 "data": {"reports": reports},
                 "meta": {
@@ -2129,6 +2173,7 @@ class DataEngine:
                     "errors": [{"source": "financial", "error_type": "fallback", "message": "using CNINFO reports list"}],
                 },
             }
+            fin_meta = fundamentals["meta"]
 
         news_payload = news_best or {"data": {"items": []}, "meta": {"filled_metrics": 0, "errors": []}}
         if (news_payload.get("meta") or {}).get("filled_metrics", 0) == 0:
@@ -2141,12 +2186,21 @@ class DataEngine:
                     "errors": [{"source": "news", "error_type": "fallback", "message": "news missing, using announcements"}],
                 },
             }
+        news_meta = news_payload.get("meta", {}) if isinstance(news_payload, dict) else {}
+        ann_meta = (ann_best or {}).get("meta", {}) if isinstance(ann_best, dict) else {}
+        if len(reports) < 1:
+            errs = ann_meta.get("errors") if isinstance(ann_meta, dict) else None
+            msg = build_error("announcements", "empty", "no announcements")
+            if isinstance(errs, list):
+                errs.append(msg)
+            else:
+                ann_meta["errors"] = [msg]
 
         evidence_pack: List[Any] = []
         for name, payload in (
             ("quote", quote_data),
-            ("kline", {"data": {"series": kline_series}, "meta": (kline_best or {}).get("meta", {})}),
-            ("financial", fundamentals),
+            ("kline", {"data": {"series": kline_series}, "meta": kline_meta}),
+            ("financial", {"data": fundamentals.get("data", {}), "meta": fin_meta}),
             ("news", news_payload),
             ("announcements", ann_best),
         ):
@@ -2163,6 +2217,14 @@ class DataEngine:
             advice_reason = "缺少K线"
         if (fundamentals.get("meta") or {}).get("filled_metrics", 0) == 0:
             advice_reason = "缺少财务" if advice_reason else "缺少财务"
+
+        meta_map = {
+            "quote": quote_meta,
+            "kline": kline_meta,
+            "financial": fin_meta,
+            "news_bundle": news_meta,
+            "announcements": ann_meta,
+        }
 
         result = {
             "code": ident["prefixed"],
@@ -2181,6 +2243,7 @@ class DataEngine:
             "advice": {"action": advice_action, "rationale": advice_reason, "risk": "控制仓位，关注公告关键词"},
             "next_steps": ["检查网络可用性", "尝试切换代码前缀"],
             "evidence_pack": evidence_pack,
+            "_meta": meta_map,
         }
         return result
     # === TuShare-first pipeline ===

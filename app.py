@@ -277,10 +277,7 @@ def _safe_fetch(fn, label: str) -> FetchResult:
 def _safe_holistic(engine, code: str):
     code_std = standardize_code(code)
     try:
-        res = engine.single_stock_tushare(
-            code_std,
-            token=st.session_state.get("tushare_token"),
-        )
+        res = engine.single_stock(code_std)
         meta = res.get("_meta") if isinstance(res, dict) else {}
         res["_meta"] = meta if isinstance(meta, dict) else {}
         res["market_data"] = res.get("quote", {})
@@ -751,6 +748,9 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 pct = md.get('pct') or md.get('pct_chg')
                 st.metric("现价", price if price is not None else "-", f"{pct}%" if pct is not None else None)
                 st.write(f"成交额: {md.get('amount') or '-'} | 量比: {md.get('vol_ratio') or '-'}")
+                st.caption(
+                    f"行情来源: {quote_meta.get('source') or '-'} | 报价: {'非实时(收盘价)' if quote_meta.get('latest_price_non_realtime') else '实时'} | 推导: {'是' if quote_meta.get('is_derived') else '否'}"
+                )
                 _render_meta(quote_meta)
                 if not quote_meta.get("ok"):
                     _render_errors(quote_meta.get("errors"))

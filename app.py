@@ -749,7 +749,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
                 st.metric("现价", price if price is not None else "-", f"{pct}%" if pct is not None else None)
                 st.write(f"成交额: {md.get('amount') or '-'} | 量比: {md.get('vol_ratio') or '-'}")
                 st.caption(
-                    f"行情来源: {quote_meta.get('source') or '-'} | 推导: {'是' if quote_meta.get('is_derived') else '否'}"
+                    f"行情来源: {quote_meta.get('source') or '-'} | 报价: {'非实时(收盘价)' if quote_meta.get('latest_price_non_realtime') else '实时'} | 推导: {'是' if quote_meta.get('is_derived') else '否'}"
                 )
                 _render_meta(quote_meta)
                 if not quote_meta.get("ok"):

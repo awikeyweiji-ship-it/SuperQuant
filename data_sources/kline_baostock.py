@@ -13,9 +13,11 @@ from data_sources.identity import canonical_identity
 from logging_utils import build_error
 
 _LOGIN_DONE = False
+_ATEEXIT_REGISTERED = False
 
 def _ensure_login():
     global _LOGIN_DONE
+    global _ATEEXIT_REGISTERED
     if _LOGIN_DONE:
         return
     if bs is None:
@@ -24,7 +26,9 @@ def _ensure_login():
     if lg.error_code != "0":
         raise RuntimeError(f"baostock login failed: {lg.error_msg}")
     _LOGIN_DONE = True
-    atexit.register(_safe_logout)
+    if not _ATEEXIT_REGISTERED:
+        atexit.register(_safe_logout)
+        _ATEEXIT_REGISTERED = True
 
 
 def _safe_logout():
@@ -40,7 +44,7 @@ def _safe_logout():
     _LOGIN_DONE = False
 
 
-def fetch(code: str, limit: int = 260) -> Dict[str, Any]:
+def fetch(code: str, limit: int = 520) -> Dict[str, Any]:
     ident = canonical_identity(code)
     errors: List[Dict[str, Any]] = []
     series: List[Dict[str, Any]] = []
@@ -80,16 +84,17 @@ def fetch(code: str, limit: int = 260) -> Dict[str, Any]:
             series = series[-limit:]
     except Exception as exc:  # noqa: BLE001
         errors.append(build_error("kline_baostock", "exception", str(exc)))
+    filled = len(series)
     meta = {
         "source": "kline_baostock",
         "retrieved_at": time.time(),
         "errors": errors,
-        "filled_metrics": len(series),
+        "filled_metrics": filled,
         "url": url,
         "status_code": status_code,
         "used_code": ident.baostock_code,
     }
-    if not series:
-        errors.append(build_error("kline_baostock", "empty", "no kline data"))
+    if filled < 120:
+        errors.append(build_error("kline_baostock", "insufficient", f"rows={filled}"))
         meta["errors"] = errors
     return {"data": {"series": series}, "meta": meta}

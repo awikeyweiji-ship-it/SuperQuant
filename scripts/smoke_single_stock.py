@@ -21,14 +21,15 @@ def run_smoke(code: str) -> int:
     result = engine.single_stock(code)
     quote_meta = (result.get("_meta", {}) or {}).get("quote", {})
     quote_filled = quote_meta.get("filled_metrics", 0) or (1 if result.get("quote", {}).get("data") else 0)
-    kline_len = len(result.get("kline", {}).get("daily", []))
+    kline = result.get("kline", {}).get("daily", [])
+    kline_len = len(kline)
     announcements = len(result.get("announcements", {}).get("data", {}).get("announcements", []))
     financial_fields = 0
     fin_meta = (result.get("_meta", {}) or {}).get("financial", {})
     if isinstance(result.get("financial"), dict):
         stmt = (result.get("financial", {}).get("data", {}) or {}).get("statements") or []
         if stmt:
-            financial_fields = len(stmt[0].keys())
+            financial_fields = len([v for v in stmt[0].values() if isinstance(v, (int, float)) and v is not None])
     financial_fields = max(financial_fields, fin_meta.get("filled_metrics", 0) or 0)
     print(json.dumps({
         "quote_filled": quote_filled,
@@ -41,7 +42,7 @@ def run_smoke(code: str) -> int:
     if quote_filled <= 0:
         print("Smoke check failed: quote missing")
         return 2
-    if kline_len < 30:
+    if kline_len < 120:
         print("Smoke check failed: insufficient kline rows")
         return 2
     if financial_fields < 8:

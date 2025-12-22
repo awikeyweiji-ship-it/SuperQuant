@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 from typing import Dict, Any, List
-
 import requests
 
 from data_sources.provider_registry import ProviderResult

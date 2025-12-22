@@ -77,31 +77,69 @@ def fetch_announcements_em(code: str, limit: int = 20, timeout: int = 10) -> Dic
         )
     if not out and not errors:
         errors.append({"source": "announcement_eastmoney", "error_type": "empty", "message": "no announcements"})
-    return {"items": out, "errors": errors}
+    meta = {
+        "source": "announcement_eastmoney",
+        "retrieved_at": time.time(),
+        "errors": errors,
+        "filled_metrics": len(out),
+        "url": url,
+    }
+    return {"data": {"announcements": out}, "meta": meta, "items": out, "errors": errors}
 
 
-def fetch_announcements_tencent(code: str, limit: int = 15, timeout: int = 10) -> List[Dict[str, Any]]:
+def fetch_announcements_tencent(code: str, limit: int = 15, timeout: int = 10) -> Dict[str, Any]:
     """简易腾讯财经兜底（使用快讯接口，字段有限）。"""
     std = _standardize_code(code)
     plain = std.split(".")[0]
     url = f"https://r.10jqka.com.cn/api/public/sec/getannouncement/{plain}/"  # 同花顺简易公告接口
-    # 若同花顺接口不可用，则快速返回空，由上层记录错误
-    resp = requests.get(url, timeout=timeout)
-    if resp.status_code != 200:
-        return []
-    payload = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    results: List[Dict[str, Any]] = []
-    for row in data[:limit]:
-        results.append(
-            {
-                "title": row.get("title", ""),
-                "date": str(row.get("publish_date", ""))[:10],
-                "url": row.get("pdf_url") or row.get("url") or "",
-                "type": row.get("column_name") or "公告",
-            }
+    errors: List[Dict[str, Any]] = []
+    anns: List[Dict[str, Any]] = []
+    status_code: int | None = None
+    body_snippet: str | None = None
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://r.10jqka.com.cn"},
         )
-    return results
+        status_code = resp.status_code
+        body_snippet = (resp.text or "")[:200]
+        if resp.status_code != 200:
+            errors.append({"source": "ann_em_tx", "error_type": "http", "message": f"status {resp.status_code}"})
+        elif "<html" in body_snippet.lower():
+            errors.append({"source": "ann_em_tx", "error_type": "blocked_html", "message": "non-json body"})
+        else:
+            payload = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            if not isinstance(data, list):
+                errors.append({"source": "ann_em_tx", "error_type": "invalid", "message": "unexpected payload"})
+                data = []
+            for row in data[:limit]:
+                anns.append(
+                    {
+                        "title": row.get("title", ""),
+                        "date": str(row.get("publish_date", ""))[:10],
+                        "url": row.get("pdf_url") or row.get("url") or "",
+                        "type": row.get("column_name") or "公告",
+                        "source": "10jqka",
+                    }
+                )
+    except Exception as exc:  # noqa: BLE001
+        errors.append({"source": "ann_em_tx", "error_type": "exception", "message": str(exc)})
+
+    if not anns and not errors:
+        errors.append({"source": "ann_em_tx", "error_type": "empty", "message": "no announcements"})
+
+    meta = {
+        "source": "ann_em_tx",
+        "retrieved_at": time.time(),
+        "errors": errors,
+        "filled_metrics": len(anns),
+        "url": url,
+        "status_code": status_code,
+        "body_snippet": body_snippet,
+    }
+    return {"data": {"announcements": anns}, "meta": meta}
 
 
 def sample_announcements(code: str, limit: int = 10) -> List[Dict[str, Any]]:

@@ -732,7 +732,7 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         c_h1, c_h2, c_h3, c_h4 = st.columns(4)
         dp = _as_dict(dp)
         md = _as_dict(dp.get('market_data'))
-        raw_close = md.get('close') or md.get('price')
+        raw_close = md.get('price') if md.get('price') not in (None, "", "--") else md.get('close')
         pct_delta = _fmt_val(md.get('pct') or md.get('pct_chg'), suffix="%")
 
         def _valid_float(val: Any) -> Optional[float]:
@@ -755,6 +755,9 @@ elif mode == "🔎 单股深度博弈 (Deep Game)":
         if derived_close is not None:
             latest_date = derived_date or "未知"
             c_h1.caption(f"非实时：使用最近收盘价 {latest_date}")
+        elif quote_meta:
+            source_badge = quote_meta.get('source') or '-'
+            c_h1.caption(f"行情源: {source_badge}")
         c_h2.metric("AI 综合评分", _fmt_val(rep.get('ai_score')))
         st.caption(
             f"行情源: {quote_meta.get('source') or '-'} | K线源: {kline_meta.get('source') or '-'} | 财报源: {fin_meta.get('source') or '-'} | 公告源: {ann_meta.get('source') or '-'}"

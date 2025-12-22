@@ -29,14 +29,18 @@ def run_smoke(code: str) -> int:
         if stmt:
             financial_fields = len([v for v in stmt[0].values() if isinstance(v, (int, float)) and v is not None])
     financial_fields = max(financial_fields, fin_meta.get("filled_metrics", 0) or 0)
+    provider_trace = result.get("provider_trace", {})
     print(json.dumps({
         "quote_filled": quote_filled,
         "quote_is_derived": quote_meta.get("is_derived"),
         "kline_len": kline_len,
         "announcements": announcements,
         "financial_fields": financial_fields,
-        "provider_trace": result.get("provider_trace", {}),
+        "provider_trace": provider_trace,
     }, ensure_ascii=False, indent=2))
+    kline_trace = provider_trace.get("kline", []) if isinstance(provider_trace, dict) else []
+    for tr in kline_trace:
+        print(f"KLINE provider {tr.get('provider')}: filled={tr.get('filled_metrics')} errors={tr.get('errors')}")
     price_val = None
     quote_data = result.get("quote", {}).get("data") or {}
     if isinstance(quote_data, dict):

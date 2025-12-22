@@ -7,23 +7,25 @@ Generated: 2025-02-19T00:00:00Z (sandbox refresh with akshare spot/kline restore
 - Platform: Linux (sandbox)
 
 ## Commands Executed (sandbox)
-- `python scripts/smoke_single_stock.py 000801` -> ✅ (kline rows: 200; quote fell back to derived close because proxy blocks akshare)
-- `python scripts/smoke_single_stock.py 600519` -> ✅ (kline rows: 200; quote fell back to derived close because proxy blocks akshare)
+- `python scripts/smoke_single_stock.py 601872` -> ⚠️ blocked by proxy (all public endpoints 403; baostock login failure). Parser now reports provider errors without crashing.
+- `python scripts/smoke_single_stock.py 000801` -> ⚠️ blocked by proxy (k线/quote 403; announcements fell back to sample). Offline sample labeled in provider trace.
 
 ### Connectivity diagnostics
-- External HTTP access to Eastmoney/Sina/Tencent/CNINFO remains blocked by the sandbox proxy (403), so akshare spot/k线 calls throw ProxyError and the pipeline falls back to cached/synthetic data. In a real Windows environment with internet, akshare should now succeed because it uses the plain 6-digit symbols from the v1 working build.
-- Decision engine remains intact and continues to consume the fetched payloads for the "投研结论卡".
+- Tencent k线 parser now accepts multiple symbol keys (sh/sz/plain) and qfq/day/daily lists; HTML bodies are flagged as `blocked_html` instead of causing empty rows.
+- Exchange / cninfo / Eastmoney announcement fetchers now send UA/Referer headers and return empty lists on HTML/404 so `NoneType.get` crashes are avoided; fallback traces capture the blocking reason.
+- Baostock logout is guarded with a sentinel to avoid duplicated socket closes (WinError 10038).
+- Sandbox proxy still returns 403 to all external hosts; on a real Windows network the primary Tencent k线/quote paths should populate >=120 rows and a non-blank price.
 
 ## Status
-- Ported the v1 working akshare paths: quote uses cached spot snapshot lookup; K线 uses plain 6-digit symbols (`stock_zh_a_hist` qfq) to avoid the prefix issue and is top priority.
-- Provider priority remains akshare → Baostock/Tencent legacy, with offline sample only if online sources fail (clearly labeled).
-- Decision engine and non-empty UI remain unchanged; derived price captions now read “非实时：使用最近收盘价 …” when realtime is missing.
+- Restored the Tencent fqkline primary path with robust key detection and numeric parsing so real rows are kept when the endpoint responds with JSON.
+- Added announcement hardening (headers + safe fallbacks) and guarded baostock logout to prevent WinError 10038.
+- UI shows quote source badge and still labels derived closes as “非实时：使用最近收盘价 …” when realtime quotes are missing.
 
 ## Provider Fallback Snapshot
 | Domain | Primary | Secondary | Offline backstop |
 | --- | --- | --- | --- |
 | Quote | akshare spot snapshot (plain code) | Eastmoney/Sina/Tencent legacy | Derived from latest K线 sample |
-| Kline | akshare stock_zh_a_hist qfq | BaoStock → Tencent | Bundled 200-row sample |
+| Kline | Tencent fqkline (qfqday/day auto-parse) | akshare stock_zh_a_hist → BaoStock | Bundled 200-row sample |
 | Financial | akshare abstract | BaoStock → CNINFO report list | Bundled sample statement |
 | Announcements | SSE/SZSE exchange | Eastmoney/Tencent/CNINFO | Bundled sample announcement |
 

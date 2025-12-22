@@ -10,6 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from data_engine import DataEngine
+from research.decision_engine import build_decision
 
 
 def run_smoke(code: str) -> int:
@@ -41,6 +42,15 @@ def run_smoke(code: str) -> int:
     if isinstance(quote_data, dict):
         price_val = quote_data.get("price") or quote_data.get("close")
     if price_val in (None, "", "--"):
+        if kline:
+            price_val = kline[-1].get("close")
+    decision = build_decision(result)
+    decision_card = decision.get("decision_card", {}) if isinstance(decision, dict) else {}
+    verdict = decision_card.get("verdict")
+    dq_score = decision_card.get("data_quality_score")
+    print("Decision card:")
+    print(json.dumps(decision_card, ensure_ascii=False, indent=2))
+    if price_val in (None, "", "--"):
         print("Smoke check failed: quote missing")
         return 2
     if kline_len < 120:
@@ -51,6 +61,12 @@ def run_smoke(code: str) -> int:
         return 2
     if announcements < 1:
         print("Smoke check failed: no announcements")
+        return 2
+    if verdict not in {"BUY", "WATCH", "AVOID"}:
+        print("Smoke check failed: invalid verdict")
+        return 2
+    if dq_score is None:
+        print("Smoke check failed: missing data quality score")
         return 2
     return 0
 

@@ -15,6 +15,7 @@ from logging_utils import build_error
 
 _LOGIN_DONE = False
 _ATEEXIT_REGISTERED = False
+_LOGOUT_SENTINEL = "_superquant_logout_done"
 
 
 def _ensure_login():
@@ -40,7 +41,10 @@ def _safe_logout():
     if bs is None:
         return
     try:
+        if getattr(bs, _LOGOUT_SENTINEL, False):
+            return
         bs.logout()
+        setattr(bs, _LOGOUT_SENTINEL, True)
     except Exception:
         pass
     _LOGIN_DONE = False

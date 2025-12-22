@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Tuple
 
+import time
 import requests
 
 from data_sources.identity import canonical_identity
@@ -16,8 +17,13 @@ def _safe_get(url: str, headers: Dict[str, str], params: Dict[str, Any], timeout
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=timeout)
             body_snippet = resp.text[:200]
+            if "<html" in (body_snippet or "").lower():
+                raise RuntimeError("blocked_html")
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                raise RuntimeError("non_json")
             return (data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []), errors, body_snippet
         except Exception as exc:  # noqa: BLE001
             if attempt >= retries:

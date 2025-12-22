@@ -10,13 +10,10 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from data_engine import DataEngine
-from tools import connectivity_doctor
 
 
 def run_smoke(code: str) -> int:
-    print("[1/2] connectivity doctor")
-    connectivity_doctor.run(code)
-    print("[2/2] data engine single_stock")
+    print("[1/1] data engine single_stock")
     engine = DataEngine()
     result = engine.single_stock(code)
     quote_meta = (result.get("_meta", {}) or {}).get("quote", {})
@@ -39,7 +36,11 @@ def run_smoke(code: str) -> int:
         "financial_fields": financial_fields,
         "provider_trace": result.get("provider_trace", {}),
     }, ensure_ascii=False, indent=2))
-    if quote_filled <= 0:
+    price_val = None
+    quote_data = result.get("quote", {}).get("data") or {}
+    if isinstance(quote_data, dict):
+        price_val = quote_data.get("price") or quote_data.get("close")
+    if price_val in (None, "", "--"):
         print("Smoke check failed: quote missing")
         return 2
     if kline_len < 120:

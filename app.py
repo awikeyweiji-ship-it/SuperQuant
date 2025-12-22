@@ -157,16 +157,6 @@ with st.sidebar.expander("🔑 神经连接 (API Keys)", expanded=True):
     st.session_state["api_key"] = ds_key
     st.session_state["tavily_key"] = tavily_key
 
-with st.sidebar.expander("💠 TuShare Pro", expanded=True):
-    ts_token = st.text_input("TuShare Pro Token", type="password", value=st.session_state.get("tushare_token", ""))
-    if st.button("Test TuShare Connectivity", use_container_width=True):
-        test_engine = st.session_state.get("engine") or DataEngine()
-        ok, msg = test_engine.test_tushare(ts_token)
-        (st.success if ok else st.error)(msg)
-    st.session_state["tushare_token"] = ts_token
-    if not ts_token:
-        st.warning("未提供 TuShare Token，单股与雷达将阻断并提示补充 token")
-
 offline_mode = st.sidebar.checkbox(
     "离线样本模式（允许使用本地样本 fallback）",
     value=os.environ.get("ALLOW_OFFLINE_SAMPLES", "").lower() in {"1", "true", "yes", "on"},

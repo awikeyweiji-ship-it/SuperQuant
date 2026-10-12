@@ -1,0 +1,40 @@
+name: Enterprise native public components
+on:
+  push:
+    branches: [build/enterprise-offline-deps-20261012]
+    paths: [.github/workflows/enterprise-native-public-components.yml]
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Download public Qt wheels only; no project source or secrets
+        shell: python
+        run: |
+          import hashlib, json, pathlib, urllib.request, zipfile
+          out=pathlib.Path('qt-components');out.mkdir()
+          rows=[]
+          for package in ['PySide6-Essentials','shiboken6']:
+              with urllib.request.urlopen('https://pypi.org/pypi/'+package+'/6.10.2/json',timeout=30) as r: meta=json.load(r)
+              for item in meta['urls']:
+                  n=item['filename']
+                  if not (n.endswith('win_amd64.whl') or n.endswith('manylinux_2_34_x86_64.whl')): continue
+                  if not item['url'].startswith('https://files.pythonhosted.org/'): raise RuntimeError('unexpected source')
+                  with urllib.request.urlopen(item['url'],timeout=90) as r: data=r.read(160000000)
+                  if len(data)!=item['size'] or hashlib.sha256(data).hexdigest()!=item['digests']['sha256']: raise RuntimeError('checksum '+n)
+                  (out/n).write_bytes(data)
+                  with zipfile.ZipFile(out/n) as z:
+                      if z.testzip(): raise RuntimeError('CRC '+n)
+                  rows.append({'package':package,'version':'6.10.2','filename':n,'sha256':item['digests']['sha256'],'size':len(data),'url':item['url']})
+                  print('VERIFIED',n,len(data))
+          if len(rows)!=4: raise RuntimeError('expected two platforms for two packages')
+          (out/'PUBLIC_COMPONENTS.json').write_text(json.dumps(rows,indent=2))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: enterprise-native-public-qt
+          path: qt-components/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error

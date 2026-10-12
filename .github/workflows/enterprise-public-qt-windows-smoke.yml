@@ -1,0 +1,69 @@
+name: Enterprise public Qt Windows smoke
+on:
+  push:
+    branches: [build/enterprise-offline-deps-20261012]
+    paths: [.github/workflows/enterprise-public-qt-windows-smoke.yml]
+permissions:
+  contents: read
+jobs:
+  public-runtime-only:
+    runs-on: windows-2022
+    timeout-minutes: 8
+    steps:
+      - name: Verify public CPython and selected Qt binaries without application or credentials
+        shell: python
+        run: |
+          import hashlib, io, json, pathlib, subprocess, urllib.request, zipfile
+          out=pathlib.Path('public-runtime-result');out.mkdir()
+          runtime=out/'runtime';runtime.mkdir();site=runtime/'Lib/site-packages';site.mkdir(parents=True)
+          def get(url,digest):
+              with urllib.request.urlopen(url,timeout=60) as r: data=r.read(160000000)
+              if hashlib.sha256(data).hexdigest()!=digest: raise RuntimeError('public archive checksum mismatch')
+              return data
+          raw=get('https://www.python.org/ftp/python/3.13.15/python-3.13.15-embed-amd64.zip','d1f04d990aee1253d8569e8e5104e30fa9f5fa830899f14843448872d936a2cf')
+          with zipfile.ZipFile(io.BytesIO(raw)) as z:z.extractall(runtime)
+          modules={'QtCore','QtGui','QtWidgets','QtNetwork','QtTest','QtSvg'}
+          plugins={'qwindows.dll','qminimal.dll','qoffscreen.dll','qmodernwindowsstyle.dll','qsvgicon.dll','qgif.dll','qico.dll','qjpeg.dll','qsvg.dll','qnetworklistmanager.dll','qcertonlybackend.dll','qschannelbackend.dll'}
+          def select(name):
+              p=pathlib.PurePosixPath(name)
+              if '.dist-info/' in name:return False
+              if name.startswith('PySide6/support/') and p.suffix=='.py':return True
+              if name.startswith('PySide6/translations/'):return p.name in {'qtbase_zh_CN.qm','qtbase_en.qm'}
+              if name.startswith('PySide6/plugins/'):return p.name in plugins
+              if p.parent.as_posix()!='PySide6':return False
+              if p.stem in modules and p.suffix in {'.pyd','.pyi'}:return True
+              if p.name in {'__init__.py','_config.py','_git_pyside_version.py','py.typed','pyside6.abi3.dll','opengl32sw.dll'}:return True
+              if p.name in {n.replace('Qt','Qt6',1)+'.dll' for n in modules}:return True
+              return p.name.startswith(('msvcp','vcruntime','concrt','vcamp','vccorlib','vcomp')) and p.suffix=='.dll'
+          pins=[('PySide6-Essentials','pyside6_essentials-6.10.2-cp39-abi3-win_amd64.whl','0741018c2b6395038cad4c41775cfae3f13a409e87995ac9f7d89e5b1fb6b22a'),('shiboken6','shiboken6-6.10.2-cp39-abi3-win_amd64.whl','10f3c8c5e1b8bee779346f21c10dbc14cff068f0b0b4e62420c82a6bf36ac2e7')]
+          files=[]
+          for package,filename,digest in pins:
+              with urllib.request.urlopen('https://pypi.org/pypi/'+package+'/6.10.2/json',timeout=30) as r: meta=json.load(r)
+              item=next(x for x in meta['urls'] if x['filename']==filename)
+              if item['digests']['sha256']!=digest or not item['url'].startswith('https://files.pythonhosted.org/'):raise RuntimeError('upstream pin mismatch')
+              with zipfile.ZipFile(io.BytesIO(get(item['url'],digest))) as z:
+                  if z.testzip():raise RuntimeError('public archive CRC failure')
+                  for name in z.namelist():
+                      p=pathlib.PurePosixPath(name)
+                      if p.is_absolute() or '..' in p.parts or p.suffix.lower() in {'.ttf','.otf','.woff','.woff2'}:continue
+                      if not (select(name) if package=='PySide6-Essentials' else not name.endswith('/')):continue
+                      data=z.read(name);target=site/pathlib.Path(*p.parts);target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
+                      files.append({'path':name,'sha256':hashlib.sha256(data).hexdigest()})
+          (runtime/'python313._pth').write_text('python313.zip\n.\nLib/site-packages\n')
+          probe="import os,json,platform,sys\nos.environ['QT_QPA_PLATFORM']='offscreen'\nfrom PySide6 import QtCore,QtGui,QtWidgets,QtNetwork,QtTest,QtSvg\na=QtWidgets.QApplication([])\nw=QtWidgets.QWidget();w.resize(200,120)\nimage=w.grab();assert not image.isNull()\nw.close()\nprint(json.dumps({'os':platform.platform(),'python':sys.version,'qt':QtCore.qVersion(),'rendered_widget':True,'application_loaded':False,'model_calls':0,'mode':'public dependency subset Windows smoke only'}))\n"
+          (runtime/'smoke.py').write_text(probe)
+          r=subprocess.run([str((runtime/'python.exe').resolve()),str((runtime/'smoke.py').resolve())],capture_output=True,text=True,timeout=30)
+          (out/'stdout.txt').write_text(r.stdout);(out/'stderr.txt').write_text(r.stderr)
+          (out/'selected-files.json').write_text(json.dumps(files,indent=2))
+          print(r.stdout);print(r.stderr)
+          if r.returncode:raise RuntimeError('public runtime smoke failed '+str(r.returncode))
+          (out/'result.json').write_text(r.stdout)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: enterprise-public-qt-windows-smoke
+          path: |
+            public-runtime-result/*.json
+            public-runtime-result/*.txt
+          retention-days: 1
+          if-no-files-found: error
